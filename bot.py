@@ -162,7 +162,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     save_db(db)
 
-    share_link = f"https://t.me/Filesharingbot?start={file_id}"
+    share_link = f"https://t.me/FilesharingUbot?start={file_id}"
 
     await message.reply_text(
         f"✅ File permanently save ho gayi!\n\n"
@@ -219,7 +219,7 @@ async def my_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📂 Aapki saved files:\n"]
     for fid, rec in user_files.items():
-        link = f"https://t.me/Filesharingbot?start={fid}"
+        link = f"https://t.me/FilesharingUbot?start={fid}"
         lines.append(f"🆔 {fid} — {rec['file_name']}\n{link}\n")
 
     await update.message.reply_text("\n".join(lines))
