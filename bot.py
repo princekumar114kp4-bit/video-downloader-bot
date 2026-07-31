@@ -1,38 +1,33 @@
 """
 Premium File Sharing Telegram Bot
-------------------------------------
-- Sirf AUTHORIZED_USERS (owner/admins) hi file upload/store kar sakte hain.
-- Koi bhi normal user file store NAHI kar sakta — sirf link/ID se receive kar sakta hai.
-- Owner file bhejta hai -> bot use PRIVATE CHANNEL me forward karta hai (permanent storage)
-  aur ek direct SHARE LINK deta hai: https://t.me/<bot_username>?start=<file_id>
-- Ye link kisi ko bhi bhej do -> wo bot ko /start karte hi seedha file receive kar lega.
-  (Jaise premium "file to link" bots kaam karte hain)
+----------------------------------
 
-Requirements:
+Features:
+- Sirf AUTHORIZED_USERS files upload/store kar sakte hain.
+- Normal users sirf shared link ya /get FILE_ID se file receive kar sakte hain.
+- File size kahin display nahi hoga.
+- Received file ke saath "📣 JOIN CHANNEL" inline button aayega.
+- Authorized uploader apni file /delete FILE_ID se delete kar sakta hai.
+- /start par authorized user ko complete command menu milega.
+- /help command available hai.
+- /myfiles se apni uploaded files dekh sakte ho.
+- /get FILE_ID se file manually receive kar sakte ho.
+- Private storage channel mein files store hoti hain.
+- Har file ka private deep-link generate hota hai.
+
+Install:
     pip install python-telegram-bot==21.0
 
-Setup steps:
-    1. @BotFather se bot bana kar token le lo. Bot ka USERNAME bhi note kar lo
-       (jaise @MyFileBot) — share link banane ke liye chahiye hoga.
-    2. Apna Telegram numeric user ID pata karo -> @userinfobot ko koi message bhejo,
-       wo tumhara ID dega (jaise 123456789).
-    3. Ek naya PRIVATE channel banao, bot ko us channel me ADMIN banao
-       ("Post Messages" permission ke saath).
-    4. Channel ID nikalo -> channel ka koi message @userinfobot ko forward karo,
-       wo channel ID dega jaise -1001234567890.
-    5. Neeche BOT_TOKEN, BOT_USERNAME, STORAGE_CHANNEL_ID, AUTHORIZED_USERS fill karo.
-    6. Run karo: python premium_file_bot.py
-
-Note:
-    - AUTHORIZED_USERS list me jitne bhi Telegram user ID daaloge, sirf wahi log
-      file upload/store kar payenge. Baaki sab ke liye upload band rahega.
-    - "storage.json" me sirf metadata (channel message_id, owner, file naam) rehta hai.
+IMPORTANT:
+    Apna NEW BOT TOKEN neeche BOT_TOKEN mein daalo.
+    Purana exposed token use mat karna.
 """
 
+import html
 import json
+import logging
 import os
 import uuid
-import logging
 from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -44,273 +39,864 @@ from telegram.ext import (
     filters,
 )
 
-# ---------------- CONFIG ----------------
-BOT_TOKEN = "8781514301:AAH4HhLVD0ye_JjoUQVC7VjtBYflxE6qz80"  # <-- token revoke karke NAYA token daalo
-BOT_USERNAME = "FilesharingUbot"  # ⚠️ @ MAT lagana yaha — sirf naam
-STORAGE_CHANNEL_ID = -1004439722221  # apna private channel ID
 
-# Sirf inhi user IDs ko file upload/store karne ki permission hogi.
-# Apna ID daalo, aur chaho to aur logon ke bhi (comma se separate karke).
-AUTHORIZED_USERS = [8597878282]  # <-- apna Telegram user ID yaha daalo
+# =========================================================
+# CONFIG
+# =========================================================
 
+# =========================================================
+# APNA NEW BOT TOKEN YAHAN DALO
+# =========================================================
+
+BOT_TOKEN = "8781514301:AAH4HhLVD0ye_JjoUQVC7VjtBYflxE6qz80"
+
+
+# Bot username WITHOUT @
+BOT_USERNAME = "FilesharingUbot"
+
+
+# Private storage channel ID
+STORAGE_CHANNEL_ID = -1004439722221
+
+
+# Sirf in Telegram user IDs ko upload/delete permission hai
+AUTHORIZED_USERS = [
+    8597878282
+]
+
+
+# =========================================================
+# APNA CHANNEL LINK YAHAN DALO
+# =========================================================
+
+JOIN_CHANNEL_URL = "https://t.me/U_BOT_CHANNEL"
+
+
+# Example:
+# JOIN_CHANNEL_URL = "https://t.me/MyChannel"
+#
+# Ya private channel invite:
+# JOIN_CHANNEL_URL = "https://t.me/+xxxxxxxxxxxxxxxx"
+
+
+# Database file
 DB_FILE = "storage.json"
+
+
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
 logger = logging.getLogger(__name__)
 
 
-# ---------------- STORAGE HELPERS ----------------
+# =========================================================
+# DATABASE
+# =========================================================
+
 def load_db():
     if not os.path.exists(DB_FILE):
         return {}
+
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+
+            if isinstance(data, dict):
+                return data
+
+            return {}
+
     except (json.JSONDecodeError, FileNotFoundError):
         return {}
 
 
 def save_db(data):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    temp_file = DB_FILE + ".tmp"
+
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    os.replace(temp_file, DB_FILE)
 
 
 def is_authorized(user_id: int) -> bool:
     return user_id in AUTHORIZED_USERS
 
 
-def format_size(size_bytes: int) -> str:
-    if not size_bytes:
-        return "Unknown"
-    for unit in ["B", "KB", "MB", "GB"]:
-        if size_bytes < 1024:
-            return f"{size_bytes:.1f} {unit}" if unit != "B" else f"{size_bytes} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.1f} TB"
+def safe_html(text: str) -> str:
+    return html.escape(
+        str(text),
+        quote=False
+    )
 
 
-# ---------------- COMMAND HANDLERS ----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Agar /start <file_id> ke saath aaya hai (deep link click), to seedha file bhejo
+# =========================================================
+# INLINE BUTTONS
+# =========================================================
+
+def join_channel_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📣 JOIN CHANNEL",
+                    url=JOIN_CHANNEL_URL
+                )
+            ]
+        ]
+    )
+
+
+def share_keyboard(share_link: str):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔗 SHARE FILE",
+                    url=f"https://t.me/share/url?url={share_link}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📣 JOIN CHANNEL",
+                    url=JOIN_CHANNEL_URL
+                )
+            ]
+        ]
+    )
+
+
+# =========================================================
+# START / HELP MENU
+# =========================================================
+
+def get_menu_text(authorized: bool):
+
+    if authorized:
+
+        return (
+            "<b>👑 PREMIUM FILE MANAGER</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+
+            "📤 <b>UPLOAD</b>\n"
+            "Simply send me a document, photo, video, "
+            "audio or voice message.\n\n"
+
+            "I will store the file securely and create "
+            "a private share link for you.\n\n"
+
+            "⚙️ <b>COMMANDS</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+
+            "<code>/start</code> — Open main menu\n"
+            "<code>/help</code> — Show command list\n"
+            "<code>/get FILE_ID</code> — Receive a file\n"
+            "<code>/myfiles</code> — Show your files\n"
+            "<code>/delete FILE_ID</code> — Delete your file\n\n"
+
+            "✨ <i>Premium mode is active for your account.</i>"
+        )
+
+    return (
+        "<b>✨ PREMIUM FILE DELIVERY</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        "📁 <b>FILE RECEIVER</b>\n"
+        "Open a valid file-sharing link and "
+        "I will send the file here.\n\n"
+
+        "⚙️ <b>COMMANDS</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+
+        "<code>/start</code> — Open main menu\n"
+        "<code>/help</code> — Show command list\n"
+        "<code>/get FILE_ID</code> — Receive a file\n\n"
+
+        "🔐 <i>File uploading is restricted to authorized users.</i>"
+    )
+
+
+# =========================================================
+# /START
+# =========================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    message = update.effective_message
+    user = update.effective_user
+
+    # -----------------------------------------------------
+    # Deep link:
+    # /start ABC123
+    # -----------------------------------------------------
+
     if context.args:
-        file_id = context.args[0]
-        await send_file_by_id(update, context, file_id)
+
+        file_id = context.args[0].strip()
+
+        await send_file_by_id(
+            update,
+            context,
+            file_id
+        )
+
         return
 
-    if is_authorized(update.message.from_user.id):
-        await update.message.reply_text(
-            "👋 Welcome back. Please send me any file, photo, video or audio whenever you're ready, "
-            "and I will store it safely for you.\n\n"
-            "Once saved, I'll hand you a private link 🔗 — simply pass that along, and whoever receives "
-            "it will get the file the moment they open it."
-        )
-    else:
-        await update.message.reply_text(
-            "👋 Hello, and welcome. This is a private file-sharing assistant.\n\n"
-            "If someone has shared a link with you, please go ahead and open it — your file will "
-            "be on its way shortly. 📁"
-        )
+    # -----------------------------------------------------
+    # Normal start
+    # -----------------------------------------------------
+
+    await message.reply_text(
+        get_menu_text(
+            is_authorized(user.id)
+        ),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    user_id = message.from_user.id
+# =========================================================
+# /HELP
+# =========================================================
 
-    # ---- SIRF AUTHORIZED USER HI STORE KAR SAKTA HAI ----
-    if not is_authorized(user_id):
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user = update.effective_user
+
+    await update.effective_message.reply_text(
+        get_menu_text(
+            is_authorized(user.id)
+        ),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+
+# =========================================================
+# HANDLE FILE UPLOAD
+# =========================================================
+
+async def handle_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    message = update.effective_message
+    user = update.effective_user
+
+    # -----------------------------------------------------
+    # AUTH CHECK
+    # -----------------------------------------------------
+
+    if not is_authorized(user.id):
+
         await message.reply_text(
-            "🙏 I'm afraid I can't accept uploads from you — this assistant only stores files for "
-            "its owner. If someone has sent you a link, please feel free to open it instead."
+            "<b>🔒 UPLOAD ACCESS LOCKED</b>\n\n"
+            "Only authorized users can upload and store files.\n\n"
+            "You can still receive shared files.",
+            parse_mode="HTML"
         )
+
         return
+
+    # -----------------------------------------------------
+    # DETECT FILE TYPE
+    # -----------------------------------------------------
 
     file_type = None
     file_name = "file"
 
     if message.document:
+
         file_type = "document"
-        file_name = message.document.file_name or "document"
+
+        file_name = (
+            message.document.file_name
+            or "document"
+        )
+
     elif message.photo:
+
         file_type = "photo"
         file_name = "photo.jpg"
+
     elif message.video:
+
         file_type = "video"
-        file_name = message.video.file_name or "video.mp4"
+
+        file_name = (
+            message.video.file_name
+            or "video.mp4"
+        )
+
     elif message.audio:
+
         file_type = "audio"
-        file_name = message.audio.file_name or "audio.mp3"
+
+        file_name = (
+            message.audio.file_name
+            or "audio.mp3"
+        )
+
     elif message.voice:
+
         file_type = "voice"
         file_name = "voice.ogg"
+
     else:
+
         await message.reply_text(
-            "🤔 That particular file type isn't something I can store just yet — a document, "
-            "photo, video, audio clip, or voice note would work perfectly."
+            "<b>⚠️ UNSUPPORTED FILE</b>\n\n"
+            "Please send a document, photo, video, "
+            "audio or voice message.",
+            parse_mode="HTML"
         )
+
         return
+
+    # -----------------------------------------------------
+    # SAVE FILE TO PRIVATE CHANNEL
+    # -----------------------------------------------------
 
     try:
+
         forwarded = await context.bot.forward_message(
+
             chat_id=STORAGE_CHANNEL_ID,
+
             from_chat_id=message.chat_id,
-            message_id=message.message_id,
+
+            message_id=message.message_id
         )
+
     except Exception as e:
-        logger.error(f"Channel me forward karte waqt error: {type(e).__name__}: {e}")
-        await message.reply_text(
-            "⚠️ I wasn't able to store that file just now.\n\n"
-            f"Here is what went wrong: `{type(e).__name__}: {e}`\n\n"
-            "Could you please check the following?\n"
-            "• Is the bot an administrator in the storage channel, with permission to post messages?\n"
-            "• Is the storage channel ID correct? You may verify it using @RawDataBot.",
-            parse_mode="Markdown",
+
+        logger.exception(
+            "Storage channel forwarding failed"
         )
+
+        await message.reply_text(
+
+            "<b>❌ UPLOAD FAILED</b>\n\n"
+
+            "I couldn't save this file.\n\n"
+
+            f"Error: <code>{safe_html(type(e).__name__)}</code>\n\n"
+
+            "Make sure the bot is an administrator "
+            "in your storage channel.",
+
+            parse_mode="HTML"
+        )
+
         return
 
-    file_id = str(uuid.uuid4())[:8]
+    # -----------------------------------------------------
+    # CREATE FILE ID
+    # -----------------------------------------------------
 
-    # File size nikaalo (jo bhi type ho usse)
-    size_bytes = 0
-    if file_type == "document":
-        size_bytes = message.document.file_size or 0
-    elif file_type == "video":
-        size_bytes = message.video.file_size or 0
-    elif file_type == "audio":
-        size_bytes = message.audio.file_size or 0
-    elif file_type == "voice":
-        size_bytes = message.voice.file_size or 0
+    file_id = uuid.uuid4().hex[:10].upper()
+
+    uploaded_at = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%d %b %Y, %H:%M UTC"
+    )
+
+    # -----------------------------------------------------
+    # SAVE METADATA
+    #
+    # SIZE intentionally NOT stored
+    # -----------------------------------------------------
 
     db = load_db()
+
     db[file_id] = {
-        "channel_message_id": forwarded.message_id,
-        "file_type": file_type,
-        "file_name": file_name,
-        "file_size": size_bytes,
-        "owner": user_id,
-        "uploaded_at": datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC"),
+
+        "channel_message_id":
+            forwarded.message_id,
+
+        "file_type":
+            file_type,
+
+        "file_name":
+            file_name,
+
+        "owner":
+            user.id,
+
+        "uploaded_at":
+            uploaded_at,
     }
+
     save_db(db)
 
-    share_link = f"https://t.me/{BOT_USERNAME}?start={file_id}"
-    size_str = format_size(size_bytes)
+    # -----------------------------------------------------
+    # SHARE LINK
+    # -----------------------------------------------------
 
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔗 Share this file", url=f"https://t.me/share/url?url={share_link}")]]
+    share_link = (
+        f"https://t.me/"
+        f"{BOT_USERNAME}"
+        f"?start={file_id}"
     )
+
+    safe_name = safe_html(file_name)
+
+    # -----------------------------------------------------
+    # SUCCESS MESSAGE
+    # -----------------------------------------------------
 
     await message.reply_text(
-        f"✅ Your file has been saved.\n\n"
-        f"📁 *Name:* {file_name}\n"
-        f"📦 *Size:* {size_str}\n"
-        f"🆔 *Reference ID:* `{file_id}`\n"
-        f"🕒 *Saved on:* {db[file_id]['uploaded_at']}\n\n"
-        f"🔗 Here is the private link — feel free to share it with anyone:\n{share_link}",
-        parse_mode="Markdown",
-        reply_markup=keyboard,
+
+        "<b>✅ FILE STORED SUCCESSFULLY</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"📁 <b>Name:</b> {safe_name}\n"
+        f"🆔 <b>ID:</b> <code>{file_id}</code>\n"
+        f"🕒 <b>Saved:</b> {uploaded_at}\n\n"
+
+        "🔗 <b>PRIVATE SHARE LINK</b>\n"
+        f"<code>{share_link}</code>\n\n"
+
+        "✨ Share this link with anyone.\n"
+        "They will receive the file directly.",
+
+        parse_mode="HTML",
+
+        disable_web_page_preview=True,
+
+        reply_markup=share_keyboard(
+            share_link
+        )
     )
 
 
-async def send_file_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str):
+# =========================================================
+# SEND FILE BY ID
+# =========================================================
+
+async def send_file_by_id(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str
+):
+
+    message = update.effective_message
+
+    file_id = file_id.strip().upper()
+
     db = load_db()
+
     record = db.get(file_id)
 
+    # -----------------------------------------------------
+    # FILE NOT FOUND
+    # -----------------------------------------------------
+
     if not record:
-        await update.message.reply_text(
-            "🔍 I couldn't find a file matching that link — it may have expired, or the link "
-            "might not be quite right."
+
+        await message.reply_text(
+
+            "<b>🔍 FILE NOT FOUND</b>\n\n"
+
+            "This file ID is invalid or the file "
+            "has already been deleted.",
+
+            parse_mode="HTML"
         )
+
         return
 
-    size_str = format_size(record.get("file_size", 0))
+    safe_name = safe_html(
+        record.get(
+            "file_name",
+            "file"
+        )
+    )
 
-    await update.message.reply_text(
-        f"📁 Here is *{record['file_name']}* ({size_str}). One moment, please. ⏳",
-        parse_mode="Markdown",
+    # -----------------------------------------------------
+    # PREMIUM STATUS MESSAGE
+    # -----------------------------------------------------
+
+    status = await message.reply_text(
+
+        "<b>✨ SECURE FILE DELIVERY</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"📁 <b>{safe_name}</b>\n"
+
+        "⏳ Preparing your file...",
+
+        parse_mode="HTML"
     )
 
     try:
+
+        # -------------------------------------------------
+        # FILE SEND
+        #
+        # JOIN CHANNEL BUTTON DIRECTLY FILE KE SAATH
+        # -------------------------------------------------
+
         await context.bot.copy_message(
-            chat_id=update.message.chat_id,
+
+            chat_id=message.chat_id,
+
             from_chat_id=STORAGE_CHANNEL_ID,
-            message_id=record["channel_message_id"],
+
+            message_id=record[
+                "channel_message_id"
+            ],
+
+            reply_markup=join_channel_keyboard()
         )
+
+        # -------------------------------------------------
+        # REMOVE STATUS MESSAGE
+        # -------------------------------------------------
+
+        try:
+
+            await status.delete()
+
+        except Exception:
+
+            pass
+
     except Exception as e:
-        logger.error(f"File bhejte waqt error: {e}")
-        await update.message.reply_text(
-            "😔 I'm sorry, something went wrong while sending that file — it may have been removed "
-            "from storage."
+
+        logger.exception(
+            "File delivery failed"
         )
 
+        try:
 
-async def get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fallback manual command: /get <id> — koi bhi user use kar sakta hai (receive-only)."""
+            await status.edit_text(
+
+                "<b>❌ DELIVERY FAILED</b>\n\n"
+
+                "This file may have been deleted "
+                "from storage.\n\n"
+
+                f"<code>{safe_html(type(e).__name__)}</code>",
+
+                parse_mode="HTML"
+            )
+
+        except Exception:
+
+            await message.reply_text(
+
+                "<b>❌ DELIVERY FAILED</b>\n\n"
+
+                "This file may have been removed "
+                "from storage.",
+
+                parse_mode="HTML"
+            )
+
+
+# =========================================================
+# /GET
+# =========================================================
+
+async def get_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     if not context.args:
-        await update.message.reply_text("📌 Please include a reference ID, like this: /get <id>")
+
+        await update.effective_message.reply_text(
+
+            "<b>📌 GET FILE</b>\n\n"
+
+            "Usage:\n"
+            "<code>/get FILE_ID</code>\n\n"
+
+            "Example:\n"
+            "<code>/get ABC1234567</code>",
+
+            parse_mode="HTML"
+        )
+
         return
-    await send_file_by_id(update, context, context.args[0])
+
+    await send_file_by_id(
+
+        update,
+        context,
+        context.args[0]
+    )
 
 
-async def my_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
+# =========================================================
+# /MYFILES
+# =========================================================
+
+async def my_files(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user_id = update.effective_user.id
+
+    # -----------------------------------------------------
+    # AUTH CHECK
+    # -----------------------------------------------------
 
     if not is_authorized(user_id):
-        await update.message.reply_text("🔒 This particular list is only available to the owner.")
+
+        await update.effective_message.reply_text(
+
+            "<b>🔒 ACCESS DENIED</b>\n\n"
+
+            "This command is only available "
+            "to authorized upload users.",
+
+            parse_mode="HTML"
+        )
+
         return
 
     db = load_db()
-    user_files = {fid: rec for fid, rec in db.items() if rec["owner"] == user_id}
+
+    user_files = {
+
+        fid: rec
+
+        for fid, rec in db.items()
+
+        if rec.get("owner") == user_id
+    }
+
+    # -----------------------------------------------------
+    # EMPTY
+    # -----------------------------------------------------
 
     if not user_files:
-        await update.message.reply_text("📭 You haven't saved any files with me yet.")
+
+        await update.effective_message.reply_text(
+
+            "<b>📭 NO SAVED FILES</b>\n\n"
+
+            "You haven't uploaded any files yet.",
+
+            parse_mode="HTML"
+        )
+
         return
 
-    lines = ["📂 Here are the files you've saved so far:\n"]
+    # -----------------------------------------------------
+    # BUILD RESPONSE
+    # -----------------------------------------------------
+
+    lines = [
+
+        "<b>📂 YOUR SAVED FILES</b>",
+
+        "━━━━━━━━━━━━━━━━━━",
+
+        ""
+    ]
+
     for fid, rec in user_files.items():
-        link = f"https://t.me/{BOT_USERNAME}?start={fid}"
-        size_str = format_size(rec.get("file_size", 0))
+
+        safe_name = safe_html(
+            rec.get(
+                "file_name",
+                "file"
+            )
+        )
+
+        link = (
+            f"https://t.me/"
+            f"{BOT_USERNAME}"
+            f"?start={fid}"
+        )
+
         lines.append(
-            f"📁 *{rec['file_name']}*\n"
-            f"🆔 Reference ID: `{fid}` · 📦 Size: {size_str}\n"
-            f"{link}\n"
+
+            f"📁 <b>{safe_name}</b>\n"
+            f"🆔 <code>{fid}</code>\n"
+            f"🔗 {link}\n"
+
         )
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.effective_message.reply_text(
 
+        "\n".join(lines),
 
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤔 I'm not quite sure how to help with that. If you have a share link, please go ahead "
-        "and open it — I'll take care of the rest."
+        parse_mode="HTML",
+
+        disable_web_page_preview=True
     )
 
 
-# ---------------- MAIN ----------------
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+# =========================================================
+# /DELETE
+# =========================================================
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("get", get_file))
-    app.add_handler(CommandHandler("myfiles", my_files))
+async def delete_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    app.add_handler(
-        MessageHandler(
-            filters.Document.ALL
-            | filters.PHOTO
-            | filters.VIDEO
-            | filters.AUDIO
-            | filters.VOICE,
-            handle_file,
+    user_id = update.effective_user.id
+
+    # -----------------------------------------------------
+    # AUTH
+    # -----------------------------------------------------
+
+    if not is_authorized(user_id):
+
+        await update.effective_message.reply_text(
+
+            "<b>🔒 DELETE ACCESS LOCKED</b>\n\n"
+
+            "Only authorized users can delete files.",
+
+            parse_mode="HTML"
         )
-    )
 
-    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+        return
 
-    logger.info("Bot chalu ho gaya... 🚀")
-    app.run_polling()
+    # -----------------------------------------------------
+    # ID CHECK
+    # -----------------------------------------------------
 
+    if not context.args:
 
-if __name__ == "__main__":
-    main()
+        await update.effective_message.reply_text(
+
+            "<b>🗑️ DELETE FILE</b>\n\n"
+
+            "Usage:\n"
+            "<code>/delete FILE_ID</code>\n\n"
+
+            "Example:\n"
+            "<code>/delete ABC1234567</code>",
+
+            parse_mode="HTML"
+        )
+
+        return
+
+    file_id = context.args[0].strip().upper()
+
+    db = load_db()
+
+    record = db.get(file_id)
+
+    # -----------------------------------------------------
+    # NOT FOUND
+    # -----------------------------------------------------
+
+    if not record:
+
+        await update.effective_message.reply_text(
+
+            "<b>🔍 FILE NOT FOUND</b>\n\n"
+
+            "That file ID does not exist "
+            "in the database.",
+
+            parse_mode="HTML"
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # OWNER CHECK
+    # -----------------------------------------------------
+
+    if record.get("owner") != user_id:
+
+        await update.effective_message.reply_text(
+
+            "<b>⛔ NOT YOUR FILE</b>\n\n"
+
+            "You can only delete files "
+            "that you uploaded.",
+
+            parse_mode="HTML"
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # DELETE FROM STORAGE CHANNEL
+    # -----------------------------------------------------
+
+    try:
+
+        await context.bot.delete_message(
+
+            chat_id=STORAGE_CHANNEL_ID,
+
+            message_id=record[
+                "channel_message_id"
+            ]
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Storage message deletion failed"
+        )
+
+        await update.effective_message.reply_text(
+
+            "<b>❌ DELETE FAILED</b>\n\n"
+
+            "I could not delete the stored file "
+            "from the storage channel.\n\n"
+
+            "Make sure the bot has delete permission "
+            "in the storage channel.\n\n"
+
+            f"<code>{safe_html(type(e).__name__)}</code>",
+
+            parse_mode="HTML"
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # DELETE DATABASE RECORD
+    # -----------------------------------------------------
+
+    del db[file_id]
+
+    save_db(db)
+
+    # -----------------------------------------------------
+    # SUCCESS
+    # -----------------------------------------------------
+
+    await update.effective_message.reply_text(
+
+        "<b>🗑️ FILE DELETED SUCCESSFULLY</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"🆔 <code>{file_id}</code>\n\n"
+
+        "✅ Storage message deleted.\n"
