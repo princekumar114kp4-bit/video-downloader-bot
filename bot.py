@@ -45,7 +45,6 @@ from telegram.ext import (
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = "8465780049:AAFCj2uVmo-4CAkYLbzNyJmsrsg3WrZUJMc"
-BOT_USERNAME = "Chatbot_Ai_Ubot"  # bina @ ke, jaise: MyFileBot
 STORAGE_CHANNEL_ID = -1004439722221  # apna private channel ID
 
 # Sirf inhi user IDs ko file upload/store karne ki permission hogi.
@@ -163,7 +162,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     save_db(db)
 
-    share_link = f"https://t.me/{BOT_USERNAME}?start={file_id}"
+    share_link = f"https://t.me/Chatbot_Ai_Ubot?start={file_id}"
 
     await message.reply_text(
         f"✅ File permanently save ho gayi!\n\n"
@@ -220,7 +219,7 @@ async def my_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📂 Aapki saved files:\n"]
     for fid, rec in user_files.items():
-        link = f"https://t.me/{BOT_USERNAME}?start={fid}"
+        link = f"https://t.me/Chatbot_Ai_Ubot?start={fid}"
         lines.append(f"🆔 {fid} — {rec['file_name']}\n{link}\n")
 
     await update.message.reply_text("\n".join(lines))
