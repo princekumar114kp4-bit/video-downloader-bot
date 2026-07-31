@@ -45,7 +45,7 @@ from telegram.ext import (
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = "8465780049:AAFCj2uVmo-4CAkYLbzNyJmsrsg3WrZUJMc"
-BOT_USERNAME = "@Chatbot_Ai_Ubot"  # bina @ ke, jaise: MyFileBot
+BOT_USERNAME = "Chatbot_Ai_Ubot"  # bina @ ke, jaise: MyFileBot
 STORAGE_CHANNEL_ID = -1004439722221  # apna private channel ID
 
 # Sirf inhi user IDs ko file upload/store karne ki permission hogi.
