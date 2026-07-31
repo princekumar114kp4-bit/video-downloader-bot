@@ -1,4 +1,1 @@
-pyTelegramBotAPI
-requests
-yt-dlp
-ffmpeg-python
+python-telegram-bot==21.0
