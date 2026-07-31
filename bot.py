@@ -33,8 +33,9 @@ import json
 import os
 import uuid
 import logging
+from datetime import datetime, timezone
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -44,7 +45,8 @@ from telegram.ext import (
 )
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = "8781514301:AAH4HhLVD0ye_JjoUQVC7VjtBYflxE6qz80"
+BOT_TOKEN = "8781514301:AAH4HhLVD0ye_JjoUQVC7VjtBYflxE6qz80"  # <-- token revoke karke NAYA token daalo
+BOT_USERNAME = "FilesharingUbot"  # ⚠️ @ MAT lagana yaha — sirf naam
 STORAGE_CHANNEL_ID = -1004439722221  # apna private channel ID
 
 # Sirf inhi user IDs ko file upload/store karne ki permission hogi.
@@ -80,6 +82,16 @@ def is_authorized(user_id: int) -> bool:
     return user_id in AUTHORIZED_USERS
 
 
+def format_size(size_bytes: int) -> str:
+    if not size_bytes:
+        return "Unknown"
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}" if unit != "B" else f"{size_bytes} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
+
 # ---------------- COMMAND HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Agar /start <file_id> ke saath aaya hai (deep link click), to seedha file bhejo
@@ -90,15 +102,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_authorized(update.message.from_user.id):
         await update.message.reply_text(
-            "👋 Namaste Owner! Mujhe koi bhi file, photo, video ya audio bhejo.\n"
-            "Main use permanently save karke ek SHARE LINK dunga.\n\n"
-            "Wo link kisi ko bhi bhej do, wo /start karte hi file paa lega."
+            "👋 Welcome back. Please send me any file, photo, video or audio whenever you're ready, "
+            "and I will store it safely for you.\n\n"
+            "Once saved, I'll hand you a private link 🔗 — simply pass that along, and whoever receives "
+            "it will get the file the moment they open it."
         )
     else:
         await update.message.reply_text(
-            "👋 Namaste! Ye ek private file-sharing bot hai.\n"
-            "Aapko koi share link mila ho to us pe click karo, file mil jaayegi.\n"
-            "Ye bot khud se naya upload accept nahi karta."
+            "👋 Hello, and welcome. This is a private file-sharing assistant.\n\n"
+            "If someone has shared a link with you, please go ahead and open it — your file will "
+            "be on its way shortly. 📁"
         )
 
 
@@ -109,9 +122,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- SIRF AUTHORIZED USER HI STORE KAR SAKTA HAI ----
     if not is_authorized(user_id):
         await message.reply_text(
-            "🚫 Sorry, aap file store nahi kar sakte.\n"
-            "Ye bot sirf receive karne ke liye hai. Agar aapke paas koi\n"
-            "share link hai, to us pe click karo."
+            "🙏 I'm afraid I can't accept uploads from you — this assistant only stores files for "
+            "its owner. If someone has sent you a link, please feel free to open it instead."
         )
         return
 
@@ -134,7 +146,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_type = "voice"
         file_name = "voice.ogg"
     else:
-        await message.reply_text("⚠️ Ye file type support nahi hai.")
+        await message.reply_text(
+            "🤔 That particular file type isn't something I can store just yet — a document, "
+            "photo, video, audio clip, or voice note would work perfectly."
+        )
         return
 
     try:
@@ -144,33 +159,57 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_id=message.message_id,
         )
     except Exception as e:
-        logger.error(f"Channel me forward karte waqt error: {e}")
+        logger.error(f"Channel me forward karte waqt error: {type(e).__name__}: {e}")
         await message.reply_text(
-            "⚠️ File channel me save nahi ho payi. Check karo:\n"
-            "- Bot channel me admin hai?\n"
-            "- STORAGE_CHANNEL_ID sahi hai?"
+            "⚠️ I wasn't able to store that file just now.\n\n"
+            f"Here is what went wrong: `{type(e).__name__}: {e}`\n\n"
+            "Could you please check the following?\n"
+            "• Is the bot an administrator in the storage channel, with permission to post messages?\n"
+            "• Is the storage channel ID correct? You may verify it using @RawDataBot.",
+            parse_mode="Markdown",
         )
         return
 
     file_id = str(uuid.uuid4())[:8]
+
+    # File size nikaalo (jo bhi type ho usse)
+    size_bytes = 0
+    if file_type == "document":
+        size_bytes = message.document.file_size or 0
+    elif file_type == "video":
+        size_bytes = message.video.file_size or 0
+    elif file_type == "audio":
+        size_bytes = message.audio.file_size or 0
+    elif file_type == "voice":
+        size_bytes = message.voice.file_size or 0
+
     db = load_db()
     db[file_id] = {
         "channel_message_id": forwarded.message_id,
         "file_type": file_type,
         "file_name": file_name,
+        "file_size": size_bytes,
         "owner": user_id,
+        "uploaded_at": datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC"),
     }
     save_db(db)
 
-    share_link = f"https://t.me/FilesharingUbot?start={file_id}"
+    share_link = f"https://t.me/{BOT_USERNAME}?start={file_id}"
+    size_str = format_size(size_bytes)
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔗 Share this file", url=f"https://t.me/share/url?url={share_link}")]]
+    )
 
     await message.reply_text(
-        f"✅ File permanently save ho gayi!\n\n"
-        f"📁 Naam: {file_name}\n"
-        f"🆔 ID: `{file_id}`\n\n"
-        f"🔗 Share Link:\n{share_link}\n\n"
-        f"Ye link kisi ko bhi bhejo, click karte hi file mil jaayegi.",
+        f"✅ Your file has been saved.\n\n"
+        f"📁 *Name:* {file_name}\n"
+        f"📦 *Size:* {size_str}\n"
+        f"🆔 *Reference ID:* `{file_id}`\n"
+        f"🕒 *Saved on:* {db[file_id]['uploaded_at']}\n\n"
+        f"🔗 Here is the private link — feel free to share it with anyone:\n{share_link}",
         parse_mode="Markdown",
+        reply_markup=keyboard,
     )
 
 
@@ -179,8 +218,18 @@ async def send_file_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE, fi
     record = db.get(file_id)
 
     if not record:
-        await update.message.reply_text("❌ Ye link/ID valid nahi hai ya file expire ho chuki hai.")
+        await update.message.reply_text(
+            "🔍 I couldn't find a file matching that link — it may have expired, or the link "
+            "might not be quite right."
+        )
         return
+
+    size_str = format_size(record.get("file_size", 0))
+
+    await update.message.reply_text(
+        f"📁 Here is *{record['file_name']}* ({size_str}). One moment, please. ⏳",
+        parse_mode="Markdown",
+    )
 
     try:
         await context.bot.copy_message(
@@ -191,14 +240,15 @@ async def send_file_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE, fi
     except Exception as e:
         logger.error(f"File bhejte waqt error: {e}")
         await update.message.reply_text(
-            "⚠️ File bhejte waqt error aaya. Ho sakta hai file delete ho gayi ho."
+            "😔 I'm sorry, something went wrong while sending that file — it may have been removed "
+            "from storage."
         )
 
 
 async def get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fallback manual command: /get <id> — koi bhi user use kar sakta hai (receive-only)."""
     if not context.args:
-        await update.message.reply_text("⚠️ Sahi tarika: /get <id>")
+        await update.message.reply_text("📌 Please include a reference ID, like this: /get <id>")
         return
     await send_file_by_id(update, context, context.args[0])
 
@@ -207,27 +257,33 @@ async def my_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
 
     if not is_authorized(user_id):
-        await update.message.reply_text("🚫 Ye command sirf owner ke liye hai.")
+        await update.message.reply_text("🔒 This particular list is only available to the owner.")
         return
 
     db = load_db()
     user_files = {fid: rec for fid, rec in db.items() if rec["owner"] == user_id}
 
     if not user_files:
-        await update.message.reply_text("📭 Aapne abhi tak koi file save nahi ki.")
+        await update.message.reply_text("📭 You haven't saved any files with me yet.")
         return
 
-    lines = ["📂 Aapki saved files:\n"]
+    lines = ["📂 Here are the files you've saved so far:\n"]
     for fid, rec in user_files.items():
-        link = f"https://t.me/FilesharingUbot?start={fid}"
-        lines.append(f"🆔 {fid} — {rec['file_name']}\n{link}\n")
+        link = f"https://t.me/{BOT_USERNAME}?start={fid}"
+        size_str = format_size(rec.get("file_size", 0))
+        lines.append(
+            f"📁 *{rec['file_name']}*\n"
+            f"🆔 Reference ID: `{fid}` · 📦 Size: {size_str}\n"
+            f"{link}\n"
+        )
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤔 Samajh nahi aaya. Agar aapke paas koi share link hai, us pe click karo."
+        "🤔 I'm not quite sure how to help with that. If you have a share link, please go ahead "
+        "and open it — I'll take care of the rest."
     )
 
 
