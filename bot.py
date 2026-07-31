@@ -1,9 +1,13 @@
 import telebot
+from telebot import apihelper
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import yt_dlp
 import os
 
-# Yahan apna Telegram Bot Token dalo (BotFather wala)
+# PythonAnywhere ke free account ke liye Proxy Configuration
+apihelper.proxy = {'https': 'http://proxy.server:3128'}
+
+# Yahan apna Telegram Bot Token dalo
 BOT_TOKEN = "8465780049:AAFCj2uVmo-4CAkYLbzNyJmsrsg3WrZUJMc"
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -48,6 +52,7 @@ def callback_query(call):
         ydl_opts = {
             'format': 'best[ext=mp4]/best',
             'outtmpl': file_path,
+            'proxy': 'http://proxy.server:3128',
             'quiet': True
         }
         
@@ -60,7 +65,7 @@ def callback_query(call):
             
             bot.delete_message(chat_id, call.message.message_id)
         except Exception as e:
-            bot.send_message(chat_id, "❌ Video download fail ho gaya.")
+            bot.send_message(chat_id, f"❌ Download fail: {str(e)}")
         finally:
             if os.path.exists(file_path):
                 os.remove(file_path)
@@ -72,6 +77,7 @@ def callback_query(call):
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': file_path,
+            'proxy': 'http://proxy.server:3128',
             'quiet': True
         }
 
@@ -84,7 +90,7 @@ def callback_query(call):
             
             bot.delete_message(chat_id, call.message.message_id)
         except Exception as e:
-            bot.send_message(chat_id, "❌ Audio download fail ho gaya.")
+            bot.send_message(chat_id, f"❌ Download fail: {str(e)}")
         finally:
             if os.path.exists(file_path):
                 os.remove(file_path)
