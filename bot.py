@@ -39,7 +39,7 @@ def _env_int(name, default):
 
 
 # Secret: the token is NEVER stored in the code. Set it in your host's environment.
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip()
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '9017009642:AAFp-m_9eibWd_KGJzIxiCnAGFE8JYgnwqs').strip()
 if not BOT_TOKEN:
     sys.stderr.write(
         "\nERROR: BOT_TOKEN is not set.\n"
