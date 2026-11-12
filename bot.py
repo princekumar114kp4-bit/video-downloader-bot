@@ -4,6 +4,7 @@ import telebot
 import subprocess
 import os
 import zipfile
+import json
 import tempfile
 import shutil
 from telebot import types
@@ -19,6 +20,7 @@ import ast
 import sys
 import atexit
 import requests
+import hashlib
 
 # --- Extra imports added by the upgrade ---
 from logging.handlers import RotatingFileHandler
@@ -39,7 +41,7 @@ def _env_int(name, default):
 
 
 # Secret: the token is NEVER stored in the code. Set it in your host's environment.
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '9017009642:AAFp-m_9eibWd_KGJzIxiCnAGFE8JYgnwqs').strip()
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip()
 if not BOT_TOKEN:
     sys.stderr.write(
         "\nERROR: BOT_TOKEN is not set.\n"
@@ -968,7 +970,7 @@ TELEGRAM_MODULES = {
     'telegram_i18n': 'telegram-i18n',
     'telegram_translate': 'telegram-translate',
 
-     # Common non-telegram examples
+    # Common non-telegram examples
     'bs4': 'beautifulsoup4',
     'requests': 'requests',
     'pillow': 'Pillow', # Note the capitalization difference
@@ -1348,26 +1350,41 @@ def create_main_menu_inline(user_id):
     return markup
 
 
-# --- Database / bot-data export and import ----------------------------------
-# Two separate scopes:
-#   * Hosting database (DATABASE_PATH): admin panel only, import limited to OWNER_ID / ADMIN_ID.
-#   * One uploaded bot's own data files: only the owner of that bot, only inside that user's folder.
-# Every import is staged first, shown to the person for a Yes/No confirmation, and the current
-# data is backed up automatically before anything is overwritten.
-DATA_EXTS = ('.db', '.sqlite', '.sqlite3', '.json', '.csv', '.txt', '.pkl', '.pickle')
-DATA_SQLITE_EXTS = ('.db', '.sqlite', '.sqlite3')
-DATA_SKIP_NAMES = {'requirements.txt', 'package.json', 'package-lock.json', 'tsconfig.json', 'nohup.out'}
-DATA_SKIP_DIRS = {'node_modules', '__pycache__', 'venv', 'env', 'site-packages'}
+# --- Full backup / restore ---------------------------------------------------
+# Two scopes, both packed into ONE zip:
+#   * Admin "Full Backup": the hosting bot's own source file + the whole hosting database +
+#     every user's folder from UPLOAD_BOTS_DIR (scripts and data). Owner / main admin only.
+#   * User "My Bots" backup: only that user's own folder (scripts + data) and their script list.
+# Every restore is staged first, shown for a Yes/Cancel confirmation, and a backup of the current
+# state is written to disk (and sent to the person) before anything is overwritten.
+# Zip entries are checked against path traversal (zip-slip), links, duplicates and size limits.
+BACKUP_FORMAT_FULL = 'demon-full-backup'
+BACKUP_FORMAT_USER = 'demon-user-backup'
+BACKUP_VERSION = 1
+SQLITE_EXTS = ('.db', '.sqlite', '.sqlite3')
 SQLITE_MAGIC = b'SQLite format 3\x00'
-IMPORT_TTL = 600                      # seconds a pending upload / confirmation stays valid
-EXPORT_MAX_BYTES = 45 * 1024 * 1024   # Telegram bots cannot send files above ~50 MB
-BACKUP_KEEP = 5                       # automatic pre-import backups kept per scope
-DB_BACKUP_DIR = os.path.join(IROTECH_DIR, 'db_backups')
-USER_DATA_BACKUP_DIR = os.path.join(IROTECH_DIR, 'user_data_backups')
+BACKUP_SKIP_DIRS = {'node_modules', '__pycache__', 'venv', 'env', 'site-packages', '.git'}
+BACKUP_SKIP_SUFFIXES = ('.log', '.pyc', '-wal', '-shm', '-journal')
 HOSTING_DB_CORE_TABLES = ('subscriptions', 'user_files', 'active_users', 'admins')
+FULL_BACKUP_MAX_MB = _env_int('FULL_BACKUP_MAX_MB', 2048)    # total size of a full backup before compression
+USER_BACKUP_MAX_MB = _env_int('USER_BACKUP_MAX_MB', 500)     # same, for one user's backup
+BACKUP_MAX_FILES = _env_int('BACKUP_MAX_FILES', 50000)
+IMPORT_TTL = 600                                             # seconds a pending upload / confirmation stays valid
+# Telegram lets a bot read files up to 20 MB, so bigger backups are sent in parts that fit that limit.
+PART_BYTES = max(1, min(MAX_UPLOAD_MB, 19)) * 1024 * 1024
+MAX_PARTS = 40
+BACKUP_KEEP = 3                                              # automatic pre-restore backups kept per scope
+FULL_BACKUP_DIR = os.path.join(IROTECH_DIR, 'full_backups')
+USER_BACKUP_DIR = os.path.join(IROTECH_DIR, 'user_backups')
+PART_RE = re.compile(r'\.zip\.(\d{1,3})$', re.IGNORECASE)
 IMPORT_LOCK = threading.RLock()
-PENDING_IMPORT_WAIT = {}      # user_id -> {'kind', 'owner', 'file', 'time'}   waiting for the upload
-PENDING_IMPORT_CONFIRM = {}   # token -> staged import waiting for Yes / No
+BACKUP_OP_LOCK = threading.Lock()   # only one export / restore at a time
+PENDING_IMPORT_WAIT = {}      # user_id -> {'kind', 'owner', 'time', 'dir', 'parts'}   waiting for the upload
+PENDING_IMPORT_CONFIRM = {}   # token -> staged restore waiting for Yes / Cancel
+
+
+class BackupTooLarge(Exception):
+    """The folder is bigger than the configured backup limit."""
 
 
 def _now_stamp():
@@ -1398,25 +1415,27 @@ def _human_size(num):
         num /= 1024
 
 
+def _safe_zip_rel(rel):
+    """A zip entry / relative path that stays inside its folder: no absolute path, no '..', no backslash."""
+    if not rel or len(rel) > 400 or any(ord(ch) < 32 for ch in rel):
+        return False
+    if rel.startswith('/') or '\\' in rel or (len(rel) > 1 and rel[1] == ':'):
+        return False
+    return all(part not in ('', '.', '..') and len(part) <= 200 for part in rel.split('/'))
+
+
 def _expire_pending_imports():
     """Forget stale waiting states and delete staged files nobody confirmed."""
     now = time.time()
     with IMPORT_LOCK:
         for uid in [u for u, p in PENDING_IMPORT_WAIT.items() if now - p['time'] > IMPORT_TTL]:
-            PENDING_IMPORT_WAIT.pop(uid, None)
+            pend = PENDING_IMPORT_WAIT.pop(uid, None)
+            if pend:
+                _rmtree_quiet(pend.get('dir'))
         for token in [t for t, e in PENDING_IMPORT_CONFIRM.items() if now - e['time'] > IMPORT_TTL]:
             entry = PENDING_IMPORT_CONFIRM.pop(token, None)
             if entry:
                 _rmtree_quiet(entry.get('dir'))
-
-
-def _discard_all_pending_imports():
-    with IMPORT_LOCK:
-        entries = list(PENDING_IMPORT_CONFIRM.values())
-        PENDING_IMPORT_CONFIRM.clear()
-        PENDING_IMPORT_WAIT.clear()
-    for entry in entries:
-        _rmtree_quiet(entry.get('dir'))
 
 
 def _prune_backups(folder, prefix, keep=BACKUP_KEEP):
@@ -1460,23 +1479,31 @@ def _download_upload(message, max_mb):
     doc = message.document
     limit = max_mb * 1024 * 1024
     if (doc.file_size or 0) > limit:
-        raise ValueError(f'That file is too big (maximum {max_mb} MB).')
+        raise ValueError(f'That file is too big for me to read (maximum {max_mb} MB per file). '
+                         'Big backups are sent as several parts (.zip.001, .zip.002 ...); send those one by one.')
     file_info = bot.get_file(doc.file_id)
     content = bot.download_file(file_info.file_path)
     if len(content) > limit:
-        raise ValueError(f'That file is too big (maximum {max_mb} MB).')
+        raise ValueError(f'That file is too big for me to read (maximum {max_mb} MB per file).')
     return content
 
 
 def _confirm_markup(token):
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(types.InlineKeyboardButton('✅ Yes, import', callback_data=f'impc_yes_{token}'),
+    markup.row(types.InlineKeyboardButton('✅ Yes, restore', callback_data=f'impc_yes_{token}'),
                types.InlineKeyboardButton('❌ Cancel', callback_data=f'impc_no_{token}'))
     return markup
 
 
 def _cancel_markup():
     return types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('❌ Cancel', callback_data='impc_cancel'))
+
+
+def _parts_markup():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(types.InlineKeyboardButton('✅ Done, check backup', callback_data='impc_done'),
+               types.InlineKeyboardButton('❌ Cancel', callback_data='impc_cancel'))
+    return markup
 
 
 def _store_confirm(entry):
@@ -1487,48 +1514,425 @@ def _store_confirm(entry):
     return token
 
 
-# --- Hosting database (admin only) ------------------------------------------
-def _can_import_global(user_id):
-    """Replacing the whole database can also replace the admin list, so only the configured
-    owner / main admin may do it (not admins that were added later)."""
+def _can_backup_global(user_id):
+    """The full backup holds every user's code, data and the admin list, so only the configured
+    owner / main admin may export or restore it (not admins that were added later)."""
     return user_id in (OWNER_ID, ADMIN_ID) and user_id in admin_ids
 
 
+def _may_manage_bot_data(user_id, owner_id):
+    # Same rule as the existing per-file handlers (start / stop / delete / logs).
+    return user_id == owner_id or user_id in admin_ids
+
+
+# --- Building a backup zip ---------------------------------------------------
+def _iter_backup_files(folder):
+    """Regular files below folder as (relative path with '/', full path). Never follows links."""
+    root = os.path.realpath(folder)
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in BACKUP_SKIP_DIRS and not os.path.islink(os.path.join(dirpath, d)))
+        for name in sorted(filenames):
+            if name.endswith(BACKUP_SKIP_SUFFIXES) or (name.startswith('.import_') and name.endswith('.tmp')):
+                continue
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full) or not os.path.isfile(full):
+                continue
+            rel = os.path.relpath(full, root).replace(os.sep, '/')
+            if _safe_zip_rel(rel):
+                yield rel, full
+
+
+def _zip_add_folder(archive, folder, prefix, snap_dir, budget):
+    """Add every file of folder to the zip under prefix. budget = {'bytes', 'files', 'max_bytes'}.
+    SQLite files are written from a consistent snapshot. Returns the number of files added."""
+    added = 0
+    for rel, full in _iter_backup_files(folder):
+        try:
+            size = os.path.getsize(full)
+        except OSError:
+            continue
+        budget['bytes'] += size
+        budget['files'] += 1
+        if budget['files'] > BACKUP_MAX_FILES or (budget['max_bytes'] and budget['bytes'] > budget['max_bytes']):
+            raise BackupTooLarge('The data is bigger than the backup size limit.')
+        try:
+            source = full
+            snap = None
+            if rel.lower().endswith(SQLITE_EXTS):
+                with open(full, 'rb') as handle:
+                    is_db = handle.read(16) == SQLITE_MAGIC
+                if is_db:
+                    snap = os.path.join(snap_dir, f'snap_{os.urandom(4).hex()}.tmp')
+                    _sqlite_snapshot(full, snap)
+                    source = snap
+            archive.write(source, prefix + rel)
+            if snap:
+                os.remove(snap)
+            added += 1
+        except OSError as exc:      # a file that vanished or cannot be read must not break the whole backup
+            logger.warning("Backup skipped %s: %s", full, redact_secrets(exc))
+    return added
+
+
+def _user_dirs():
+    """[(user_id_text, folder)] for every numeric folder in UPLOAD_BOTS_DIR (the folder name is the owner)."""
+    found = []
+    try:
+        names = sorted(os.listdir(UPLOAD_BOTS_DIR))
+    except OSError:
+        return found
+    for name in names:
+        folder = os.path.join(UPLOAD_BOTS_DIR, name)
+        if name.isdigit() and len(name) <= 19 and os.path.isdir(folder) and not os.path.islink(folder):
+            found.append((name, folder))
+    return found
+
+
+def _snapshot_live_database(dest_path):
+    with DB_LOCK:
+        source = db_connect()
+        try:
+            target = sqlite3.connect(dest_path)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+        finally:
+            source.close()
+
+
 def _db_counts(path):
-    """(users, scripts, subscriptions, admins) of a database file, plus an error text or ''."""
+    """(users, scripts, subscriptions, admins) of a database file."""
     conn = sqlite3.connect(path, timeout=10)
     try:
-        counts = []
-        for table in ('active_users', 'user_files', 'subscriptions', 'admins'):
-            counts.append(conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0])
-        return tuple(counts)
+        return tuple(conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+                     for table in ('active_users', 'user_files', 'subscriptions', 'admins'))
     finally:
         conn.close()
 
 
+def _build_full_backup(zip_path, limit_mb=FULL_BACKUP_MAX_MB):
+    """Write the full backup zip (source + database + every user folder). limit_mb=None means no size limit
+    (used for the automatic safety backup). Returns a summary dict."""
+    work = tempfile.mkdtemp(prefix='demon_fullbk_')
+    try:
+        db_snap = os.path.join(work, 'bot_data.db')
+        _snapshot_live_database(db_snap)
+        counts = _db_counts(db_snap)
+        source_path = os.path.abspath(__file__)
+        budget = {'bytes': 0, 'files': 0, 'max_bytes': limit_mb * 1024 * 1024 if limit_mb else None}
+        users = {}
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+            archive.write(source_path, 'source/' + os.path.basename(source_path))
+            archive.write(db_snap, 'database/bot_data.db')
+            for uid_text, folder in _user_dirs():
+                added = _zip_add_folder(archive, folder, f'upload_bots/{uid_text}/', work, budget)
+                if added:
+                    users[uid_text] = added
+            manifest = {'format': BACKUP_FORMAT_FULL, 'version': BACKUP_VERSION,
+                        'created': datetime.now().isoformat(timespec='seconds'),
+                        'source_name': os.path.basename(source_path),
+                        'database_counts': {'users': counts[0], 'scripts': counts[1],
+                                            'subscriptions': counts[2], 'admins': counts[3]},
+                        'users': users}
+            archive.writestr('manifest.json', json.dumps(manifest, indent=1))
+        return {'counts': counts, 'users': len(users), 'files': sum(users.values()),
+                'source_name': os.path.basename(source_path)}
+    finally:
+        _rmtree_quiet(work)
+
+
+def _build_user_backup(owner_id, zip_path, limit_mb=USER_BACKUP_MAX_MB):
+    """Write one user's backup zip (their folder + script list). Returns a summary dict;
+    'files' is 0 when the folder holds nothing to back up."""
+    work = tempfile.mkdtemp(prefix=f'demon_userbk_{owner_id}_')
+    try:
+        folder = get_user_folder(owner_id)
+        budget = {'bytes': 0, 'files': 0, 'max_bytes': limit_mb * 1024 * 1024 if limit_mb else None}
+        scripts = [{'name': name, 'type': ftype} for name, ftype in sorted(user_files.get(owner_id, []))]
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+            added = _zip_add_folder(archive, folder, 'bots/', work, budget)
+            manifest = {'format': BACKUP_FORMAT_USER, 'version': BACKUP_VERSION, 'owner': owner_id,
+                        'created': datetime.now().isoformat(timespec='seconds'),
+                        'scripts': scripts, 'files': added}
+            archive.writestr('manifest.json', json.dumps(manifest, indent=1))
+        return {'files': added, 'scripts': len(scripts), 'bytes': budget['bytes']}
+    finally:
+        _rmtree_quiet(work)
+
+
+def _send_backup_file(chat_id, zip_path, base_name, caption):
+    """Send a zip as one document, or as numbered parts (name.zip.001 ...) that fit Telegram's 20 MB read
+    limit, so the same file can be sent back for a restore. Returns the number of parts (0 = too big)."""
+    size = os.path.getsize(zip_path)
+    if size <= PART_BYTES:
+        with open(zip_path, 'rb') as handle:
+            bot.send_document(chat_id, handle, caption=caption, parse_mode='HTML')
+        return 1
+    total = -(-size // PART_BYTES)
+    if total > MAX_PARTS:
+        return 0
+    part_dir = tempfile.mkdtemp(prefix='demon_parts_')
+    try:
+        with open(zip_path, 'rb') as src:
+            for index in range(1, total + 1):
+                part_path = os.path.join(part_dir, f'{base_name}.zip.{index:03d}')
+                with open(part_path, 'wb') as out:
+                    out.write(src.read(PART_BYTES))
+                text = caption if index == 1 else f'Part {index} of {total}'
+                if index == 1:
+                    text += (f'\n\nThis backup is big, so it comes in <b>{total} parts</b> '
+                             '(.zip.001, .zip.002 ...). Keep all of them; send them back in any order when restoring.')
+                with open(part_path, 'rb') as handle:
+                    bot.send_document(chat_id, handle, caption=text, parse_mode='HTML')
+                os.remove(part_path)
+    finally:
+        _rmtree_quiet(part_dir)
+    return total
+
+
+# --- Reading a backup zip (shared, zip-slip safe) -----------------------------
+def _extract_backup_zip(zip_path, payload_dir, rel_ok, max_bytes):
+    """Check every entry, then extract into payload_dir. rel_ok(rel) says which entry names are allowed.
+    Returns (manifest_dict, error_text)."""
+    try:
+        archive = zipfile.ZipFile(zip_path)
+    except (zipfile.BadZipFile, OSError):
+        return None, 'That file is damaged or is not a zip backup.'
+    try:
+        with archive:
+            items = [i for i in archive.infolist() if not i.is_dir()]
+            if not items:
+                return None, 'That backup is empty.'
+            if len(items) > BACKUP_MAX_FILES:
+                return None, f'Too many files in the backup (maximum {BACKUP_MAX_FILES}).'
+            seen = set()
+            for item in items:
+                rel = item.filename
+                if not _safe_zip_rel(rel):
+                    return None, f'The backup contains an unsafe path: {rel[:60]!r}.'
+                if item.flag_bits & 0x1:
+                    return None, 'The backup is password protected.'
+                if ((item.external_attr >> 16) & 0o170000) == 0o120000:
+                    return None, f'The backup contains a link, which is not allowed: {rel[:60]!r}.'
+                if rel != 'manifest.json' and not rel_ok(rel):
+                    return None, f'The backup contains something that does not belong here: {rel[:60]!r}.'
+                if rel.lower() in seen:
+                    return None, f'The backup contains the same file twice: {rel[:60]!r}.'
+                seen.add(rel.lower())
+            if 'manifest.json' not in seen:
+                return None, 'This is not a backup made by this bot (manifest missing).'
+            if sum(max(0, i.file_size) for i in items) > max_bytes:
+                return None, f'The backup is bigger than the {max_bytes // (1024 * 1024)} MB limit.'
+            root = os.path.realpath(payload_dir)
+            written = 0
+            for item in items:
+                dest = os.path.realpath(os.path.join(root, item.filename))
+                if dest == root or not _path_inside(root, dest):
+                    return None, 'The backup contains an unsafe path.'
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with archive.open(item) as src, open(dest, 'wb') as out:
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > max_bytes:
+                            return None, f'The backup is bigger than the {max_bytes // (1024 * 1024)} MB limit.'
+                        out.write(chunk)
+    except (zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError):
+        return None, 'That backup could not be read (damaged or unsupported zip).'
+    try:
+        manifest_path = os.path.join(payload_dir, 'manifest.json')
+        if os.path.getsize(manifest_path) > 2 * 1024 * 1024:
+            return None, 'The backup manifest is too big.'
+        with open(manifest_path, 'r', encoding='utf-8') as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError):
+        return None, 'The backup manifest could not be read.'
+    if not isinstance(manifest, dict):
+        return None, 'The backup manifest could not be read.'
+    try:
+        if int(manifest.get('version', 0)) > BACKUP_VERSION:
+            return None, 'This backup was made by a newer version of the bot.'
+    except (TypeError, ValueError):
+        return None, 'The backup manifest could not be read.'
+    return manifest, ''
+
+
 def _inspect_hosting_db(path):
-    """Check an uploaded file really is a hosting-bot database. Returns (ok, message, counts)."""
+    """Check a file really is a hosting-bot database. Returns (ok, message, counts)."""
     try:
         with open(path, 'rb') as handle:
             if handle.read(16) != SQLITE_MAGIC:
-                return False, 'That is not a SQLite database file. Send the .db file you exported from this bot.', None
+                return False, 'The database inside the backup is not a SQLite database.', None
         conn = sqlite3.connect(path, timeout=10)
         try:
             result = conn.execute('PRAGMA integrity_check').fetchone()
             if not result or result[0] != 'ok':
-                return False, 'That database file is damaged, so I did not import it.', None
+                return False, 'The database inside the backup is damaged, so I did not restore it.', None
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         finally:
             conn.close()
         missing = [t for t in HOSTING_DB_CORE_TABLES if t not in tables]
         if missing:
-            return False, ('This database does not look like a backup of this hosting bot '
+            return False, ('The database inside the backup does not look like one from this hosting bot '
                            f'(missing: {", ".join(missing)}). Nothing was changed.'), None
         return True, '', _db_counts(path)
     except sqlite3.Error:
-        return False, 'I could not read that database file. Nothing was changed.', None
+        return False, 'The database inside the backup could not be read. Nothing was changed.', None
 
 
+def _full_rel_ok(rel):
+    parts = rel.split('/')
+    if parts[0] == 'source':
+        return len(parts) == 2 and parts[1].endswith('.py')
+    if parts[0] == 'database':
+        return rel == 'database/bot_data.db'
+    if parts[0] == 'upload_bots':
+        return len(parts) >= 3 and parts[1].isdigit() and len(parts[1]) <= 19
+    return False
+
+
+def _inspect_full_backup(zip_path, payload_dir):
+    """Validate + extract a full backup. Returns (ok, error_text, info)."""
+    manifest, err = _extract_backup_zip(zip_path, payload_dir, _full_rel_ok, FULL_BACKUP_MAX_MB * 1024 * 1024)
+    if err:
+        return False, err, None
+    if manifest.get('format') != BACKUP_FORMAT_FULL:
+        return False, ('This is not a full backup. Use <b>Export Full Backup</b> in the admin panel '
+                       'to make one.'), None
+    db_path = os.path.join(payload_dir, 'database', 'bot_data.db')
+    if not os.path.isfile(db_path):
+        return False, 'The backup has no database in it.', None
+    ok, problem, counts = _inspect_hosting_db(db_path)
+    if not ok:
+        return False, problem, None
+    source_path = source_name = None
+    source_dir = os.path.join(payload_dir, 'source')
+    if os.path.isdir(source_dir):
+        names = [n for n in os.listdir(source_dir) if n.endswith('.py')]
+        if len(names) != 1:
+            return False, 'The backup should hold exactly one bot code file.', None
+        source_name = names[0]
+        source_path = os.path.join(source_dir, source_name)
+        try:
+            if os.path.getsize(source_path) > 8 * 1024 * 1024:
+                return False, 'The bot code file inside the backup is too big.', None
+            with open(source_path, 'rb') as handle:
+                text = handle.read().decode('utf-8')
+            compile(text, source_name, 'exec')     # syntax check only; nothing is executed
+        except (UnicodeDecodeError, SyntaxError, ValueError, OSError):
+            return False, ('The bot code inside the backup does not compile, so I did not restore it. '
+                           'Nothing was changed.'), None
+    users = {}
+    upload_root = os.path.join(payload_dir, 'upload_bots')
+    if os.path.isdir(upload_root):
+        for uid_text in sorted(os.listdir(upload_root)):
+            count = sum(len(files) for _d, _n, files in os.walk(os.path.join(upload_root, uid_text)))
+            users[uid_text] = count
+    info = {'counts': counts, 'users': users, 'files': sum(users.values()),
+            'source_path': source_path, 'source_name': source_name,
+            'created': str(manifest.get('created', ''))[:19]}
+    return True, '', info
+
+
+def _user_rel_ok(rel):
+    parts = rel.split('/')
+    return parts[0] == 'bots' and len(parts) >= 2
+
+
+def _inspect_user_backup(zip_path, payload_dir, owner_id, importer_id):
+    """Validate + extract a single user's backup for owner_id. Returns (ok, error_text, info)."""
+    manifest, err = _extract_backup_zip(zip_path, payload_dir, _user_rel_ok, USER_BACKUP_MAX_MB * 1024 * 1024)
+    if err:
+        return False, err, None
+    if manifest.get('format') != BACKUP_FORMAT_USER:
+        return False, ('This is not a "My Bots" backup. Use the <b>Export My Bots</b> button '
+                       'in My Files to make one.'), None
+    if manifest.get('owner') != owner_id:
+        return False, 'This backup belongs to a different account, so I cannot restore it here.', None
+    bots_root = os.path.join(payload_dir, 'bots')
+    files = []
+    for dirpath, _dirs, names in os.walk(bots_root):
+        for name in names:
+            files.append(os.path.relpath(os.path.join(dirpath, name), bots_root).replace(os.sep, '/'))
+    files.sort()
+    if not files:
+        return False, 'That backup has no files in it.', None
+    # Databases must really be databases, so a bad file cannot break the bot.
+    for rel in files:
+        if rel.lower().endswith(SQLITE_EXTS):
+            full = os.path.join(bots_root, rel)
+            try:
+                with open(full, 'rb') as handle:
+                    magic_ok = handle.read(16) == SQLITE_MAGIC
+                if not magic_ok:
+                    return False, f'"{rel}" is not a valid SQLite database.', None
+                conn = sqlite3.connect(full, timeout=10)
+                try:
+                    result = conn.execute('PRAGMA integrity_check').fetchone()
+                finally:
+                    conn.close()
+                if not result or result[0] != 'ok':
+                    return False, f'"{rel}" is a damaged database.', None
+            except sqlite3.Error:
+                return False, f'"{rel}" could not be read as a database.', None
+    scripts = []
+    for entry in manifest.get('scripts') or []:
+        name = entry.get('name') if isinstance(entry, dict) else None
+        ftype = entry.get('type') if isinstance(entry, dict) else None
+        if (not isinstance(name, str) or '/' in name or '\\' in name or not _safe_zip_rel(name)
+                or ftype not in ('py', 'js') or not name.lower().endswith('.' + ftype)):
+            continue
+        if name in files:
+            scripts.append((name, ftype))
+    existing = {item[0] for item in user_files.get(owner_id, [])}
+    new_scripts = [s for s in scripts if s[0] not in existing]
+    limit = get_user_file_limit(owner_id)
+    if len(existing) + len(new_scripts) > limit:
+        return False, (f'Restoring would put you over your file limit ({len(existing)} now + {len(new_scripts)} new, '
+                       f'limit {limit}). Delete a bot first or ask an admin. Nothing was changed.'), None
+    # Restored scripts skip the upload review, so anything the review would flag is refused here.
+    # Admins are trusted and may restore everything.
+    if importer_id not in admin_ids:
+        for rel in files:
+            ext = os.path.splitext(rel)[1].lower()
+            if ext not in ('.py', '.js'):
+                continue
+            try:
+                with open(os.path.join(bots_root, rel), 'r', encoding='utf-8', errors='ignore') as handle:
+                    reasons = _code_security_reasons(handle.read(), ext[1:])
+            except OSError:
+                continue
+            if reasons:
+                return False, (f'"{rel}" contains operations that need admin review '
+                               f'({", ".join(reasons[:3])}). Upload it normally so an admin can approve it. '
+                               'Nothing was changed.'), None
+    info = {'files': files, 'scripts': scripts, 'new_scripts': len(new_scripts), 'bots_root': bots_root,
+            'existing_files': sum(1 for rel in files if os.path.isfile(os.path.join(get_user_folder(owner_id), rel))),
+            'created': str(manifest.get('created', ''))[:19]}
+    return True, '', info
+
+
+# --- Stopping scripts before a restore -----------------------------------------
+def _stop_scripts(owner_id=None):
+    """Stop running scripts (all, or one user's) without letting the watchdog bring them back."""
+    with STATE_LOCK:
+        items = [(key, info) for key, info in bot_scripts.items()
+                 if owner_id is None or key.startswith(f'{owner_id}_')]
+    for key, info in items:
+        RESTART_STATE.setdefault(key, {"attempts": 0, "manual_stop": False})["manual_stop"] = True
+        try:
+            kill_process_tree(info)
+        except Exception:
+            logger.exception("Could not stop %s before restore", key)
+        _forget_script(key)
+    return len(items)
+
+
+# --- Admin: full backup ----------------------------------------------------------
 def _reload_memory_state():
     """After a database restore: reload the in-memory copies from the new database."""
     with STATE_LOCK:
@@ -1543,122 +1947,10 @@ def _reload_memory_state():
         load_data()
 
 
-def export_database_callback(call):
-    """Send the hosting bot's own database as a file (admins only; checked by the dispatcher)."""
-    bot.answer_callback_query(call.id, 'Preparing the database file...')
-    tmp_dir = tempfile.mkdtemp(prefix='demon_dbexport_')
-    try:
-        export_path = os.path.join(tmp_dir, f'hosting_bot_database_{_now_stamp()}.db')
-        with DB_LOCK:
-            source = db_connect()
-            try:
-                target = sqlite3.connect(export_path)
-                try:
-                    source.backup(target)
-                finally:
-                    target.close()
-            finally:
-                source.close()
-        counts = _db_counts(export_path)
-        with open(export_path, 'rb') as export_file:
-            bot.send_document(call.message.chat.id, export_file,
-                              caption=('<b>📥 Database Export</b>\n'
-                                       f'Users: <b>{counts[0]}</b> | Scripts: <b>{counts[1]}</b> | '
-                                       f'Subscriptions: <b>{counts[2]}</b> | Admins: <b>{counts[3]}</b>\n'
-                                       'Keep this file safe. Use <b>Import Database</b> to restore it.'),
-                              parse_mode='HTML')
-        logger.info("Database exported by admin %s", call.from_user.id)
-    except Exception as exc:
-        logger.exception('Database export failed')
-        bot.send_message(call.message.chat.id,
-                         f'⚠️ Database export failed: <code>{html_escape(str(exc)[:300])}</code>', parse_mode='HTML')
-    finally:
-        _rmtree_quiet(tmp_dir)
-
-
-def import_database_callback(call):
-    uid = call.from_user.id
-    if not _can_import_global(uid):
-        bot.answer_callback_query(call.id, '⚠️ Only the owner can import the database.', show_alert=True)
-        return
-    bot.answer_callback_query(call.id)
-    _expire_pending_imports()
-    with IMPORT_LOCK:
-        PENDING_IMPORT_WAIT[uid] = {'kind': 'global', 'time': time.time()}
-    bot.send_message(
-        call.message.chat.id,
-        ('<b>📤 Import Database</b>\n'
-         'Send me the <code>.db</code> file you exported earlier (as a file/document).\n\n'
-         '⚠️ This replaces <b>all</b> live hosting data (users, scripts list, subscriptions, admins, bans). '
-         'I will show you a summary and ask you to confirm first, and the current database is backed up '
-         'automatically before anything is overwritten.\n'
-         f'The request expires in {IMPORT_TTL // 60} minutes.'),
-        parse_mode='HTML', reply_markup=_cancel_markup())
-
-
-def _stage_global_import(message):
-    uid = message.from_user.id
-    if not _can_import_global(uid):
-        bot.reply_to(message, '⚠️ Only the owner can import the database.')
-        return
-    doc = message.document
-    name = (doc.file_name or '').lower()
-    if not name.endswith(DATA_SQLITE_EXTS):
-        bot.reply_to(message, '⚠️ Please send the database file you exported (it ends with .db). Nothing was changed.')
-        return
-    tmp_dir = tempfile.mkdtemp(prefix='demon_dbimport_')
-    keep = False
-    try:
-        try:
-            content = _download_upload(message, MAX_UPLOAD_MB)
-        except ValueError as exc:
-            bot.reply_to(message, f'⚠️ {exc}')
-            return
-        except Exception as exc:
-            logger.warning("Database import download failed: %s", redact_secrets(exc))
-            bot.reply_to(message, '⚠️ I could not download that file. Please try again.')
-            return
-        staged = os.path.join(tmp_dir, 'upload.db')
-        with open(staged, 'wb') as handle:
-            handle.write(content)
-        ok, problem, counts = _inspect_hosting_db(staged)
-        if not ok:
-            bot.reply_to(message, f'⚠️ {problem}')
-            return
-        try:
-            current = _db_counts(DATABASE_PATH)
-        except sqlite3.Error:
-            current = ('?', '?', '?', '?')
-        token = _store_confirm({'kind': 'global', 'user_id': uid, 'dir': tmp_dir, 'path': staged})
-        keep = True
-        bot.reply_to(
-            message,
-            ('<b>⚠️ Confirm database import</b>\n'
-             'This will REPLACE the live hosting database.\n\n'
-             f'<b>Uploaded file:</b> {counts[0]} users, {counts[1]} scripts, {counts[2]} subscriptions, {counts[3]} admins\n'
-             f'<b>Current live data:</b> {current[0]} users, {current[1]} scripts, {current[2]} subscriptions, {current[3]} admins\n\n'
-             'A timestamped backup of the current database is taken automatically before the switch. Continue?'),
-            parse_mode='HTML', reply_markup=_confirm_markup(token))
-    finally:
-        if not keep:
-            _rmtree_quiet(tmp_dir)
-
-
-def _apply_global_import(staged_path):
-    """Back up the live database, then overwrite it with the staged one. Returns (backup_path, missing_scripts)."""
-    os.makedirs(DB_BACKUP_DIR, exist_ok=True)
-    backup_path = os.path.join(DB_BACKUP_DIR, f'bot_data_before_import_{_now_stamp()}.db')
+def _replace_live_database(source_path):
+    """Overwrite the live database with source_path (SQLite backup API, safe while in use) and reload memory."""
     with DB_LOCK:
-        live = db_connect()
-        try:
-            backup_conn = sqlite3.connect(backup_path)
-            try:
-                live.backup(backup_conn)
-            finally:
-                backup_conn.close()
-        finally:
-            live.close()
-        source = sqlite3.connect(staged_path, timeout=30)
+        source = sqlite3.connect(source_path, timeout=30)
         try:
             dest = db_connect()
             try:
@@ -1673,331 +1965,431 @@ def _apply_global_import(staged_path):
             source.close()
         init_db()            # missing tables are created and the owner / main admin are always kept
         _reload_memory_state()
-    _prune_backups(DB_BACKUP_DIR, 'bot_data_before_import_')
-    missing = 0
-    for uid, items in list(user_files.items()):
-        for file_name, _ftype in list(items):
-            if not os.path.isfile(os.path.join(UPLOAD_BOTS_DIR, str(uid), file_name)):
-                missing += 1
-    return backup_path, missing
 
 
-# --- One uploaded bot's own data (owner of that bot only) --------------------
-def _is_safe_data_rel(rel):
-    """Relative path of a data file: only plain folders and allowed data extensions."""
-    if not rel or len(rel) > 200 or '\x00' in rel:
-        return False
-    if rel.startswith('/') or '\\' in rel or (len(rel) > 1 and rel[1] == ':'):
-        return False
-    parts = rel.split('/')
-    for part in parts:
-        if part in ('', '.', '..') or part.startswith('.'):
-            return False
-    if any(part in DATA_SKIP_DIRS for part in parts[:-1]):
-        return False
-    name = parts[-1]
-    return name.lower() not in DATA_SKIP_NAMES and os.path.splitext(name)[1].lower() in DATA_EXTS
-
-
-def _list_bot_data_files(user_folder):
-    """Data files inside one user's folder: [(relative_path, full_path, size)]. Never leaves the folder."""
-    root = os.path.realpath(user_folder)
-    if not _path_inside(os.path.realpath(UPLOAD_BOTS_DIR), root) or root == os.path.realpath(UPLOAD_BOTS_DIR):
-        return []
-    found = []
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = [d for d in dirnames
-                       if d not in DATA_SKIP_DIRS and not d.startswith('.')
-                       and not os.path.islink(os.path.join(dirpath, d))]
-        for file_name in filenames:
-            full = os.path.join(dirpath, file_name)
-            if os.path.islink(full) or not os.path.isfile(full):
-                continue
-            if not _path_inside(root, os.path.realpath(full)):
-                continue
-            rel = os.path.relpath(full, root).replace(os.sep, '/')
-            if not _is_safe_data_rel(rel):
-                continue
-            try:
-                found.append((rel, full, os.path.getsize(full)))
-            except OSError:
-                continue
-            if len(found) > MAX_ZIP_FILES:
-                return sorted(found)
-    return sorted(found)
-
-
-def _may_manage_bot_data(user_id, owner_id):
-    # Same rule as the existing per-file handlers (start / stop / delete / logs).
-    return user_id == owner_id or user_id in admin_ids
-
-
-def _bot_data_target(call, prefix):
-    """Parse 'bdx_<owner>_<file>' / 'bdi_<owner>_<file>' and check the requester owns that bot.
-    Returns (owner_id, file_name) or None after telling the user why."""
+def full_backup_callback(call):
+    """Send ONE zip: bot source code + database + every user's uploaded bots and data."""
+    if not _can_backup_global(call.from_user.id):
+        bot.answer_callback_query(call.id, '⚠️ Only the owner can export the full backup.', show_alert=True)
+        return
+    if not BACKUP_OP_LOCK.acquire(blocking=False):
+        bot.answer_callback_query(call.id, '⏳ Another backup or restore is running. Try again in a minute.', show_alert=True)
+        return
+    tmp_dir = tempfile.mkdtemp(prefix='demon_fullexport_')
     try:
-        _, owner_str, file_name = call.data.split('_', 2)
-        owner_id = int(owner_str)
+        bot.answer_callback_query(call.id, 'Preparing the full backup...')
+        bot.send_message(call.message.chat.id, '⏳ Building the full backup (code + database + all users\' bots and data)...')
+        base = f'demon_full_backup_{_now_stamp()}'
+        zip_path = os.path.join(tmp_dir, base + '.zip')
+        try:
+            summary = _build_full_backup(zip_path)
+        except BackupTooLarge:
+            bot.send_message(call.message.chat.id,
+                             f'⚠️ The data is bigger than the backup limit ({FULL_BACKUP_MAX_MB} MB). '
+                             'The limit can be raised with FULL_BACKUP_MAX_MB.')
+            return
+        counts = summary['counts']
+        caption = ('<b>📦 Full Backup</b>\n'
+                   f'Bot code: <code>{html_escape(summary["source_name"])}</code>\n'
+                   f'Database: {counts[0]} users, {counts[1]} scripts, {counts[2]} subscriptions, {counts[3]} admins\n'
+                   f'Users\' bots and data: {summary["users"]} users, {summary["files"]} files\n'
+                   f'Size: {_human_size(os.path.getsize(zip_path))}\n\n'
+                   'Keep it safe (it holds everyone\'s code and data). Use <b>Import Full Backup</b> to restore it.')
+        sent = _send_backup_file(call.message.chat.id, zip_path, base, caption)
+        if not sent:
+            bot.send_message(call.message.chat.id,
+                             '⚠️ The backup is too big to send through Telegram, even in parts. '
+                             'Copy the data folder from the server instead.')
+        logger.info("Full backup exported by admin %s (%s users, %s files, %s part(s))",
+                    call.from_user.id, summary['users'], summary['files'], sent)
+    except Exception as exc:
+        logger.exception('Full backup export failed')
+        bot.send_message(call.message.chat.id,
+                         f'⚠️ Full backup failed: <code>{html_escape(str(exc)[:300])}</code>', parse_mode='HTML')
+    finally:
+        BACKUP_OP_LOCK.release()
+        _rmtree_quiet(tmp_dir)
+
+
+def _start_waiting(call, kind, owner_id, title, body):
+    bot.answer_callback_query(call.id)
+    _expire_pending_imports()
+    with IMPORT_LOCK:
+        old = PENDING_IMPORT_WAIT.pop(call.from_user.id, None)
+        PENDING_IMPORT_WAIT[call.from_user.id] = {'kind': kind, 'owner': owner_id, 'time': time.time(),
+                                                  'dir': None, 'parts': {}}
+    if old:
+        _rmtree_quiet(old.get('dir'))
+    bot.send_message(call.message.chat.id, f'<b>{title}</b>\n{body}\nThe request expires in {IMPORT_TTL // 60} minutes.',
+                     parse_mode='HTML', reply_markup=_cancel_markup())
+
+
+def full_restore_callback(call):
+    if not _can_backup_global(call.from_user.id):
+        bot.answer_callback_query(call.id, '⚠️ Only the owner can import the full backup.', show_alert=True)
+        return
+    _start_waiting(
+        call, 'full', None, '♻️ Import Full Backup',
+        'Send me the full backup <code>.zip</code> you exported earlier (as a file). If it came in parts '
+        '(<code>.zip.001</code>, <code>.zip.002</code> ...), send every part, then tap <b>Done</b>.\n\n'
+        '⚠️ This restores <b>everything</b>: the database, every user\'s bots and data (back into each user\'s '
+        'own folder), and the bot code file. I will show you a summary and ask you to confirm first. '
+        'A backup of the current state is saved automatically before anything is overwritten.')
+
+
+# --- User: My Bots backup -------------------------------------------------------
+def _user_target(call):
+    """Parse 'ubk_<owner>' / 'ubr_<owner>' and check the requester may manage that folder."""
+    try:
+        owner_id = int(call.data.split('_', 1)[1])
     except (ValueError, IndexError):
         bot.answer_callback_query(call.id, 'Error: invalid action data.', show_alert=True)
         return None
     if not _may_manage_bot_data(call.from_user.id, owner_id):
-        logger.warning("User %s tried bot-data access for user %s (%s)", call.from_user.id, owner_id, file_name)
-        bot.answer_callback_query(call.id, '⚠️ You can only export or import data of your own bots.', show_alert=True)
+        logger.warning("User %s tried a bot backup for user %s", call.from_user.id, owner_id)
+        bot.answer_callback_query(call.id, '⚠️ You can only export or import your own bots.', show_alert=True)
         return None
-    if not any(item[0] == file_name for item in user_files.get(owner_id, [])):
-        bot.answer_callback_query(call.id, '⚠️ File not found.', show_alert=True)
-        return None
-    return owner_id, file_name
+    return owner_id
 
 
-def _any_script_running(owner_id):
-    return any(is_bot_running(owner_id, item[0]) for item in list(user_files.get(owner_id, [])))
-
-
-def export_bot_data_callback(call):
-    target = _bot_data_target(call, 'bdx')
-    if not target:
+def user_backup_callback(call):
+    """Send ONE zip with this user's own bots (scripts) and their data."""
+    owner_id = _user_target(call)
+    if owner_id is None:
         return
-    owner_id, file_name = target
-    files = _list_bot_data_files(get_user_folder(owner_id))
-    if not files:
-        bot.answer_callback_query(
-            call.id, '⚠️ No data files found yet (looking for .db, .sqlite, .json, .csv, .txt, .pkl). '
-                     'Run your bot first so it can create its data.', show_alert=True)
+    if not BACKUP_OP_LOCK.acquire(blocking=False):
+        bot.answer_callback_query(call.id, '⏳ Another backup is running. Try again in a minute.', show_alert=True)
         return
-    if len(files) > MAX_ZIP_FILES or sum(item[2] for item in files) > MAX_UNZIPPED_MB * 1024 * 1024:
-        bot.answer_callback_query(call.id, '⚠️ Your data is too big to export in one go.', show_alert=True)
-        return
-    bot.answer_callback_query(call.id, 'Preparing your data file...')
-    tmp_dir = tempfile.mkdtemp(prefix=f'demon_botdata_{owner_id}_')
+    tmp_dir = tempfile.mkdtemp(prefix=f'demon_userexport_{owner_id}_')
     try:
-        stem = re.sub(r'[^A-Za-z0-9_-]+', '_', os.path.splitext(file_name)[0])[:40] or 'bot'
-        zip_path = os.path.join(tmp_dir, f'{stem}_data_{_now_stamp()}.zip')
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
-            for index, (rel, full, _size) in enumerate(files):
-                if rel.lower().endswith(DATA_SQLITE_EXTS):
-                    snap = os.path.join(tmp_dir, f'snap_{index}.tmp')
-                    _sqlite_snapshot(full, snap)
-                    archive.write(snap, rel)
-                    os.remove(snap)
-                else:
-                    archive.write(full, rel)
-        if os.path.getsize(zip_path) > EXPORT_MAX_BYTES:
-            bot.send_message(call.message.chat.id, '⚠️ Your data file is too big to send through Telegram (over 45 MB).')
+        bot.answer_callback_query(call.id, 'Preparing your backup...')
+        base = f'my_bots_backup_{owner_id}_{_now_stamp()}'
+        zip_path = os.path.join(tmp_dir, base + '.zip')
+        try:
+            summary = _build_user_backup(owner_id, zip_path)
+        except BackupTooLarge:
+            bot.send_message(call.message.chat.id,
+                             f'⚠️ Your bots and data are bigger than the backup limit ({USER_BACKUP_MAX_MB} MB).')
             return
-        listing = '\n'.join(f'• <code>{html_escape(rel)}</code>' for rel, _f, _s in files[:12])
-        more = f'\n…and {len(files) - 12} more' if len(files) > 12 else ''
-        with open(zip_path, 'rb') as zip_file:
-            bot.send_document(
-                call.message.chat.id, zip_file,
-                caption=(f'<b>📥 Data export for</b> <code>{html_escape(file_name)}</code>\n'
-                         f'{listing}{more}\n\nUse <b>Import Data</b> on the same bot to restore it.'),
-                parse_mode='HTML')
-        logger.info("Bot data exported: user=%s script=%s files=%s", owner_id, file_name, len(files))
+        if not summary['files']:
+            bot.send_message(call.message.chat.id, '⚠️ You have no bots or data to export yet.')
+            return
+        caption = ('<b>📦 My Bots backup</b>\n'
+                   f'{summary["scripts"]} bot(s), {summary["files"]} file(s) (your bot code and its data), '
+                   f'{_human_size(os.path.getsize(zip_path))}\n\n'
+                   'Use <b>Import My Bots</b> in My Files to restore it.')
+        sent = _send_backup_file(call.message.chat.id, zip_path, base, caption)
+        if not sent:
+            bot.send_message(call.message.chat.id, '⚠️ Your backup is too big to send through Telegram.')
+        logger.info("User backup exported: owner=%s by=%s files=%s", owner_id, call.from_user.id, summary['files'])
     except Exception as exc:
-        logger.exception('Bot data export failed')
+        logger.exception('User backup export failed')
         bot.send_message(call.message.chat.id,
-                         f'⚠️ Data export failed: <code>{html_escape(str(exc)[:300])}</code>', parse_mode='HTML')
+                         f'⚠️ Export failed: <code>{html_escape(str(exc)[:300])}</code>', parse_mode='HTML')
     finally:
+        BACKUP_OP_LOCK.release()
         _rmtree_quiet(tmp_dir)
 
 
-def import_bot_data_init_callback(call):
-    target = _bot_data_target(call, 'bdi')
-    if not target:
+def user_restore_callback(call):
+    owner_id = _user_target(call)
+    if owner_id is None:
         return
-    owner_id, file_name = target
-    if _any_script_running(owner_id):
-        bot.answer_callback_query(
-            call.id, '⚠️ Stop your running bots first. They share the same data folder, so data cannot be replaced while they run.',
-            show_alert=True)
-        return
-    bot.answer_callback_query(call.id)
-    _expire_pending_imports()
+    _start_waiting(
+        call, 'user', owner_id, '♻️ Import My Bots',
+        'Send me the <code>.zip</code> you exported with <b>Export My Bots</b> (as a file). If it came in parts '
+        '(<code>.zip.001</code>, <code>.zip.002</code> ...), send every part, then tap <b>Done</b>.\n\n'
+        '⚠️ Your bots and data go back into your own folder only; files with the same name are replaced. '
+        'Your running bots are stopped for the restore. I will show you a summary and ask you to confirm first, '
+        'and your current files are backed up automatically (and sent to you).')
+
+
+# --- Receiving the uploaded backup (single zip or parts) --------------------------
+def _say(chat_id, text, markup=None):
+    return bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=markup)
+
+
+def _wait_permission_ok(uid, pend):
+    if pend['kind'] == 'full':
+        return _can_backup_global(uid)
+    return _may_manage_bot_data(uid, pend['owner'])
+
+
+def _discard_wait(uid):
     with IMPORT_LOCK:
-        PENDING_IMPORT_WAIT[call.from_user.id] = {'kind': 'bot', 'owner': owner_id, 'file': file_name, 'time': time.time()}
-    bot.send_message(
-        call.message.chat.id,
-        (f'<b>📤 Import Data for</b> <code>{html_escape(file_name)}</code>\n'
-         'Send me the data file you exported earlier (the .zip), or a single data file '
-         '(.db, .sqlite, .json, .csv, .txt, .pkl).\n\n'
-         '⚠️ Files with the same name in your bot folder will be replaced. I will show you what changes and '
-         'ask you to confirm first, and your current data is backed up automatically (and sent to you).\n'
-         f'The request expires in {IMPORT_TTL // 60} minutes.'),
-        parse_mode='HTML', reply_markup=_cancel_markup())
+        pend = PENDING_IMPORT_WAIT.pop(uid, None)
+    if pend:
+        _rmtree_quiet(pend.get('dir'))
+    return pend
 
 
-def _plan_bot_import(upload_path, upload_name, user_folder, payload_dir):
-    """Validate the upload and extract it into payload_dir. Returns (list_of_rel_paths, error)."""
-    lower = (upload_name or '').lower()
-    max_total = MAX_UNZIPPED_MB * 1024 * 1024
-    rels = []
-    if lower.endswith('.zip'):
-        try:
-            archive = zipfile.ZipFile(upload_path)
-        except zipfile.BadZipFile:
-            return None, 'That zip file is damaged or not a zip.'
-        with archive:
-            items = [i for i in archive.infolist() if not i.is_dir()]
-            if not items:
-                return None, 'That zip file has no data files in it.'
-            if len(items) > MAX_ZIP_FILES:
-                return None, f'Too many files in the zip (maximum {MAX_ZIP_FILES}).'
-            seen = set()
-            for item in items:
-                rel = item.filename.replace('\\', '/')
-                if not _is_safe_data_rel(rel):
-                    return None, (f'The zip contains a file that is not allowed: {rel[:80]}. '
-                                  'Only data files (.db, .sqlite, .json, .csv, .txt, .pkl) are accepted.')
-                if ((item.external_attr >> 16) & 0o170000) == 0o120000:
-                    return None, f'The zip contains a link, which is not allowed: {rel[:80]}.'
-                if rel.lower() in seen:
-                    return None, f'The zip contains the same file twice: {rel[:80]}.'
-                seen.add(rel.lower())
-                rels.append((rel, item))
-            if sum(max(0, i.file_size) for _r, i in rels) > max_total:
-                return None, f'The data is bigger than the {MAX_UNZIPPED_MB} MB limit.'
-            written = 0
-            root = os.path.realpath(payload_dir)
-            for rel, item in rels:
-                dest = os.path.realpath(os.path.join(root, rel))
-                if not _path_inside(root, dest):
-                    return None, 'The zip contains an unsafe path.'
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                with archive.open(item) as src, open(dest, 'wb') as out:
-                    while True:
-                        chunk = src.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        written += len(chunk)
-                        if written > max_total:
-                            return None, f'The data is bigger than the {MAX_UNZIPPED_MB} MB limit.'
-                        out.write(chunk)
-            rels = [rel for rel, _i in rels]
-    else:
-        base = os.path.basename((upload_name or '').replace('\\', '/'))
-        base = re.sub(r'[^A-Za-z0-9_.-]+', '_', base).lstrip('.')
-        if not base or os.path.splitext(base)[1].lower() not in DATA_EXTS or base.lower() in DATA_SKIP_NAMES:
-            return None, ('Please send the exported .zip, or one data file '
-                          '(.db, .sqlite, .json, .csv, .txt, .pkl).')
-        existing = [rel for rel, _f, _s in _list_bot_data_files(user_folder) if os.path.basename(rel) == base]
-        if len(existing) > 1:
-            return None, f'There is more than one "{base}" in your folder. Please send the exported .zip so I know which one.'
-        rel = existing[0] if existing else base
-        if not _is_safe_data_rel(rel):
-            return None, 'That file name is not allowed.'
-        dest = os.path.join(payload_dir, rel)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        shutil.copyfile(upload_path, dest)
-        rels = [rel]
-    # Database files must really be databases, so a bad file cannot break the bot.
-    for rel in rels:
-        if rel.lower().endswith(DATA_SQLITE_EXTS):
-            full = os.path.join(payload_dir, rel)
-            try:
-                with open(full, 'rb') as handle:
-                    if handle.read(16) != SQLITE_MAGIC:
-                        return None, f'"{rel}" is not a valid SQLite database.'
-                conn = sqlite3.connect(full, timeout=10)
-                try:
-                    result = conn.execute('PRAGMA integrity_check').fetchone()
-                finally:
-                    conn.close()
-                if not result or result[0] != 'ok':
-                    return None, f'"{rel}" is a damaged database.'
-            except sqlite3.Error:
-                return None, f'"{rel}" could not be read as a database.'
-    return rels, ''
-
-
-def _stage_bot_import(message, pend):
+def _receive_backup_upload(message, pend):
     uid = message.from_user.id
-    owner_id, file_name = pend['owner'], pend['file']
-    if not _may_manage_bot_data(uid, owner_id) or not any(item[0] == file_name for item in user_files.get(owner_id, [])):
-        bot.reply_to(message, '⚠️ You can only import data for your own bots.')
+    chat_id = message.chat.id
+    if not _wait_permission_ok(uid, pend):
+        _discard_wait(uid)
+        _say(chat_id, '⚠️ You are not allowed to do this restore. Nothing was changed.')
         return
-    if _any_script_running(owner_id):
-        bot.reply_to(message, '⚠️ Stop your running bots first, then start the import again.')
+    name = message.document.file_name or ''
+    part = PART_RE.search(name)
+    if not part and not name.lower().endswith('.zip'):
+        _say(chat_id, '⚠️ Please send the backup <code>.zip</code> (or its <code>.zip.001</code>, '
+                      '<code>.zip.002</code> parts). Nothing was changed.', _cancel_markup())
         return
-    doc = message.document
-    tmp_dir = tempfile.mkdtemp(prefix=f'demon_botimport_{owner_id}_')
+    try:
+        content = _download_upload(message, MAX_UPLOAD_MB)
+    except ValueError as exc:
+        _say(chat_id, f'⚠️ {html_escape(str(exc))}', _cancel_markup())
+        return
+    except Exception as exc:
+        logger.warning("Backup download failed: %s", redact_secrets(exc))
+        _say(chat_id, '⚠️ I could not download that file. Please try again.', _cancel_markup())
+        return
+    with IMPORT_LOCK:
+        if not pend.get('dir'):
+            pend['dir'] = tempfile.mkdtemp(prefix='demon_restore_')
+        work = pend['dir']
+        pend['time'] = time.time()
+    if part:
+        number = int(part.group(1))
+        if number < 1 or number > MAX_PARTS:
+            _say(chat_id, '⚠️ That part number is not valid.', _cancel_markup())
+            return
+        part_path = os.path.join(work, f'part_{number:03d}')
+        with open(part_path, 'wb') as handle:
+            handle.write(content)
+        pend['parts'][number] = part_path
+        have = ', '.join(str(n) for n in sorted(pend['parts']))
+        _say(chat_id, f'✅ Part {number} received. Parts so far: {have}.\n'
+                      'Send the next part, or tap <b>Done</b> when you have sent all of them.', _parts_markup())
+        return
+    with IMPORT_LOCK:
+        PENDING_IMPORT_WAIT.pop(uid, None)
+    zip_path = os.path.join(work, 'upload.zip')
+    with open(zip_path, 'wb') as handle:
+        handle.write(content)
+    _stage_backup(chat_id, uid, pend, zip_path)
+
+
+def _assemble_parts(pend):
+    """Join the received parts into one zip. Returns (zip_path, error_text)."""
+    numbers = sorted(pend['parts'])
+    if numbers != list(range(1, numbers[-1] + 1)):
+        missing = [str(n) for n in range(1, numbers[-1] + 1) if n not in pend['parts']]
+        return None, f'Part(s) missing: {", ".join(missing)}. Send them, then tap Done again.'
+    limit = (FULL_BACKUP_MAX_MB if pend['kind'] == 'full' else USER_BACKUP_MAX_MB) * 1024 * 1024
+    zip_path = os.path.join(pend['dir'], 'upload.zip')
+    total = 0
+    with open(zip_path, 'wb') as out:
+        for number in numbers:
+            with open(pend['parts'][number], 'rb') as src:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        return None, 'The parts together are bigger than the backup size limit.'
+                    out.write(chunk)
+            os.remove(pend['parts'][number])
+    return zip_path, ''
+
+
+def _stage_backup(chat_id, uid, pend, zip_path):
+    """Validate the uploaded zip and ask for confirmation. Owns pend['dir'] from here on."""
+    work = pend['dir']
     keep = False
     try:
+        payload = os.path.join(work, 'payload')
+        os.makedirs(payload, exist_ok=True)
+        if pend['kind'] == 'full':
+            ok, problem, info = _inspect_full_backup(zip_path, payload)
+        else:
+            ok, problem, info = _inspect_user_backup(zip_path, payload, pend['owner'], uid)
+        if not ok:
+            _say(chat_id, f'⚠️ {problem} Nothing was changed.')
+            return
         try:
-            content = _download_upload(message, MAX_UPLOAD_MB)
-        except ValueError as exc:
-            bot.reply_to(message, f'⚠️ {exc}')
-            return
-        except Exception as exc:
-            logger.warning("Bot data import download failed: %s", redact_secrets(exc))
-            bot.reply_to(message, '⚠️ I could not download that file. Please try again.')
-            return
-        upload_path = os.path.join(tmp_dir, 'upload.bin')
-        with open(upload_path, 'wb') as handle:
-            handle.write(content)
-        payload_dir = os.path.join(tmp_dir, 'payload')
-        os.makedirs(payload_dir)
-        user_folder = get_user_folder(owner_id)
-        rels, problem = _plan_bot_import(upload_path, doc.file_name, user_folder, payload_dir)
-        if problem:
-            bot.reply_to(message, f'⚠️ {problem} Nothing was changed.')
-            return
-        existing = {rel for rel, _f, _s in _list_bot_data_files(user_folder)}
-        lines = []
-        for rel in sorted(rels)[:15]:
-            lines.append(f'• <code>{html_escape(rel)}</code> — ' + ('replaces existing' if rel in existing else 'new'))
-        more = f'\n…and {len(rels) - 15} more' if len(rels) > 15 else ''
-        token = _store_confirm({'kind': 'bot', 'user_id': uid, 'owner': owner_id, 'file': file_name,
-                                'dir': tmp_dir, 'payload': payload_dir, 'rels': sorted(rels)})
+            os.remove(zip_path)
+        except OSError:
+            pass
+        if pend['kind'] == 'full':
+            counts = info['counts']
+            now = _db_counts(DATABASE_PATH)
+            code_line = (f'• Bot code: <code>{html_escape(info["source_name"])}</code> (replaced on disk; the old '
+                         'file is kept next to it as a .bak copy and the new code is used after the next restart)'
+                         if info['source_path'] else '• Bot code: not in this backup, stays as it is')
+            text = ('<b>⚠️ Confirm full restore</b>'
+                    + (f' (backup from {html_escape(info["created"])})' if info['created'] else '') + '\n\n'
+                    f'<b>In the backup:</b> {counts[0]} users, {counts[1]} scripts, {counts[2]} subscriptions, '
+                    f'{counts[3]} admins; {len(info["users"])} user folder(s) with {info["files"]} files\n'
+                    f'<b>Live now:</b> {now[0]} users, {now[1]} scripts, {now[2]} subscriptions, {now[3]} admins\n\n'
+                    'This will replace:\n'
+                    '• The whole database\n'
+                    f'• Each of the {len(info["users"])} user folders (every user\'s bots and data go back to that same user)\n'
+                    f'{code_line}\n\n'
+                    'All running bots are stopped. A full backup of the current state is saved first and sent to you. Continue?')
+            entry = {'kind': 'full', 'user_id': uid, 'dir': work, 'payload': payload, 'info': info}
+        else:
+            text = ('<b>⚠️ Confirm restore of your bots</b>'
+                    + (f' (backup from {html_escape(info["created"])})' if info['created'] else '') + '\n\n'
+                    f'{len(info["files"])} file(s), {len(info["scripts"])} bot(s) '
+                    f'({info["new_scripts"]} not in your list yet). '
+                    f'{info["existing_files"]} existing file(s) with the same name will be replaced.\n'
+                    'Your running bots will be stopped. Your current files are backed up first and sent to you. Continue?')
+            entry = {'kind': 'user', 'user_id': uid, 'owner': pend['owner'], 'dir': work, 'payload': payload,
+                     'info': info}
+        token = _store_confirm(entry)
         keep = True
-        bot.reply_to(
-            message,
-            (f'<b>⚠️ Confirm data import for</b> <code>{html_escape(file_name)}</code>\n'
-             + '\n'.join(lines) + more +
-             '\n\nExisting files with the same name will be overwritten. Your current data is backed up '
-             'automatically first and the backup is sent to you. Continue?'),
-            parse_mode='HTML', reply_markup=_confirm_markup(token))
+        _say(chat_id, text, _confirm_markup(token))
+    except Exception:
+        logger.exception('Restore staging failed')
+        _say(chat_id, '⚠️ Something went wrong while checking that backup. Nothing was changed.')
     finally:
         if not keep:
-            _rmtree_quiet(tmp_dir)
+            _rmtree_quiet(work)
 
 
-def _apply_bot_import(entry):
-    """Back up what will be overwritten, then write the staged files. Returns (written, backup_path or None)."""
-    owner_id = entry['owner']
-    user_folder = get_user_folder(owner_id)
-    root = os.path.realpath(user_folder)
-    if not _path_inside(os.path.realpath(UPLOAD_BOTS_DIR), root) or root == os.path.realpath(UPLOAD_BOTS_DIR):
-        raise RuntimeError('Your folder could not be verified.')
-    backup_path = None
-    overwritten = []
-    for rel in entry['rels']:
-        dest = os.path.join(root, rel)
-        if os.path.isfile(dest) and not os.path.islink(dest) and _path_inside(root, os.path.realpath(dest)):
-            overwritten.append(rel)
-    if overwritten:
-        backup_dir = os.path.join(USER_DATA_BACKUP_DIR, str(owner_id))
-        os.makedirs(backup_dir, exist_ok=True)
-        stem = re.sub(r'[^A-Za-z0-9_-]+', '_', os.path.splitext(entry['file'])[0])[:40] or 'bot'
-        backup_path = os.path.join(backup_dir, f'{stem}_before_import_{_now_stamp()}.zip')
-        snap_dir = tempfile.mkdtemp(prefix='demon_botbackup_')
+def _handle_pending_import_upload(message):
+    """Called first by the document handler. True when the document belonged to a waiting restore."""
+    uid = message.from_user.id
+    with IMPORT_LOCK:
+        _expire_pending_imports()
+        pend = PENDING_IMPORT_WAIT.get(uid)
+    if not pend:
+        return False
+    try:
+        _receive_backup_upload(message, pend)
+    except Exception:
+        logger.exception('Restore upload failed')
+        _discard_wait(uid)
+        bot.reply_to(message, '⚠️ Something went wrong while checking that file. Nothing was changed.')
+    return True
+
+
+# --- Applying a restore -----------------------------------------------------------
+def _install_restored_source(source_path):
+    """Put the restored bot code on disk for the next start. The running process keeps its already loaded
+    code, so nothing breaks now. The old file is kept as a .bak copy. Returns (status, name)."""
+    if not source_path:
+        return 'none', ''
+    live = os.path.abspath(__file__)
+    with open(source_path, 'rb') as handle:
+        new_bytes = handle.read()
+    try:
+        with open(live, 'rb') as handle:
+            if handle.read() == new_bytes:
+                return 'same', os.path.basename(live)
+    except OSError:
+        pass
+    stamp = _now_stamp()
+    try:
+        if os.path.isfile(live):
+            shutil.copy2(live, f'{live}.bak_{stamp}')
+        tmp_path = f'{live}.new_{os.urandom(4).hex()}'
         try:
-            with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as archive:
-                for index, rel in enumerate(overwritten):
-                    full = os.path.join(root, rel)
-                    if rel.lower().endswith(DATA_SQLITE_EXTS):
-                        snap = os.path.join(snap_dir, f'snap_{index}.tmp')
-                        _sqlite_snapshot(full, snap)
-                        archive.write(snap, rel)
-                    else:
-                        archive.write(full, rel)
+            with open(tmp_path, 'wb') as handle:
+                handle.write(new_bytes)
+            os.replace(tmp_path, live)
         finally:
-            _rmtree_quiet(snap_dir)
-        _prune_backups(backup_dir, f'{stem}_before_import_')
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        _prune_backups(os.path.dirname(live), os.path.basename(live) + '.bak_')
+        return 'replaced', os.path.basename(live)
+    except OSError as exc:
+        logger.warning("Could not overwrite the bot code file (%s); saving it next to it instead", exc)
+        stem = os.path.splitext(os.path.basename(live))[0]
+        aside = os.path.join(os.path.dirname(live), f'{stem}_restored_{stamp}.py')
+        with open(aside, 'wb') as handle:
+            handle.write(new_bytes)
+        return 'saved_aside', os.path.basename(aside)
+
+
+def _apply_full_restore(entry):
+    """Safety backup -> database -> user folders -> bot code. Returns a result dict."""
+    info = entry['info']
+    payload = entry['payload']
+    os.makedirs(FULL_BACKUP_DIR, exist_ok=True)
+    stopped = _stop_scripts()
+    pre_path = os.path.join(FULL_BACKUP_DIR, f'full_backup_before_restore_{_now_stamp()}.zip')
+    _build_full_backup(pre_path, limit_mb=None)       # nothing is touched if this fails
+    _prune_backups(FULL_BACKUP_DIR, 'full_backup_before_restore_')
+    prev_db = os.path.join(entry['dir'], 'previous_bot_data.db')
+    _snapshot_live_database(prev_db)
+    incoming = tempfile.mkdtemp(prefix='.restore_in_', dir=UPLOAD_BOTS_DIR)
+    old_dir = tempfile.mkdtemp(prefix='.restore_old_', dir=UPLOAD_BOTS_DIR)
+    swapped = []
+    db_replaced = False
+    try:
+        upload_root = os.path.join(payload, 'upload_bots')
+        for uid_text in sorted(info['users']):
+            shutil.move(os.path.join(upload_root, uid_text), os.path.join(incoming, uid_text))
+        _replace_live_database(os.path.join(payload, 'database', 'bot_data.db'))
+        db_replaced = True
+        for uid_text in sorted(info['users']):
+            target = os.path.join(UPLOAD_BOTS_DIR, uid_text)
+            if os.path.lexists(target):
+                os.rename(target, os.path.join(old_dir, uid_text))
+            swapped.append(uid_text)
+            os.rename(os.path.join(incoming, uid_text), target)
+    except Exception:
+        rollback_ok = True
+        for uid_text in reversed(swapped):          # put every folder back the way it was
+            target = os.path.join(UPLOAD_BOTS_DIR, uid_text)
+            saved = os.path.join(old_dir, uid_text)
+            try:
+                if os.path.lexists(saved):
+                    _rmtree_quiet(target)
+                    os.rename(saved, target)
+            except OSError:
+                rollback_ok = False
+                logger.exception("Could not roll back folder %s (original kept in %s)", uid_text, old_dir)
+        if db_replaced:
+            try:
+                _replace_live_database(prev_db)
+            except Exception:
+                logger.exception("Could not roll back the database")
+        _rmtree_quiet(incoming)
+        if rollback_ok:
+            _rmtree_quiet(old_dir)
+        raise
+    _rmtree_quiet(incoming)
+    _rmtree_quiet(old_dir)
+    try:
+        source_status, source_name = _install_restored_source(info['source_path'])
+    except Exception:
+        logger.exception("Bot code could not be restored")
+        source_status, source_name = 'failed', ''
+    missing = 0
+    for owner_id, items in list(user_files.items()):
+        for file_name, _ftype in list(items):
+            if not os.path.isfile(os.path.join(UPLOAD_BOTS_DIR, str(owner_id), file_name)):
+                missing += 1
+    return {'pre_path': pre_path, 'stopped': stopped, 'source_status': source_status,
+            'source_name': source_name, 'missing': missing}
+
+
+def _apply_user_restore(entry):
+    """Back up the user's current folder, then write the staged files into their own folder only."""
+    owner_id = entry['owner']
+    info = entry['info']
+    root = os.path.realpath(get_user_folder(owner_id))
+    upload_root = os.path.realpath(UPLOAD_BOTS_DIR)
+    if root == upload_root or not _path_inside(upload_root, root) or os.path.basename(root) != str(owner_id):
+        raise RuntimeError('Your folder could not be verified.')
+    stopped = _stop_scripts(owner_id)
+    pre_path = None
+    backup_dir = os.path.join(USER_BACKUP_DIR, str(owner_id))
+    os.makedirs(backup_dir, exist_ok=True)
+    candidate = os.path.join(backup_dir, f'my_bots_before_restore_{_now_stamp()}.zip')
+    if _build_user_backup(owner_id, candidate, limit_mb=None)['files']:
+        pre_path = candidate
+        _prune_backups(backup_dir, 'my_bots_before_restore_')
+    else:
+        os.remove(candidate)
     written = 0
-    for rel in entry['rels']:
-        src = os.path.join(entry['payload'], rel)
+    for rel in info['files']:
+        src = os.path.join(info['bots_root'], rel)
         dest = os.path.join(root, rel)
         dest_dir = os.path.dirname(dest)
         os.makedirs(dest_dir, exist_ok=True)
@@ -2013,43 +2405,27 @@ def _apply_bot_import(entry):
                     os.remove(tmp_target)
                 except OSError:
                     pass
-        if rel.lower().endswith(DATA_SQLITE_EXTS):
+        if rel.lower().endswith(SQLITE_EXTS):
             for suffix in ('-wal', '-shm', '-journal'):   # stale side files would corrupt the restored database
                 try:
                     os.remove(dest + suffix)
                 except OSError:
                     pass
         written += 1
-    return written, backup_path
-
-
-# --- Shared upload interception and confirmation -----------------------------
-def _handle_pending_import_upload(message):
-    """Called first by the document handler. True when the document belonged to a waiting import."""
-    uid = message.from_user.id
-    with IMPORT_LOCK:
-        _expire_pending_imports()
-        pend = PENDING_IMPORT_WAIT.pop(uid, None)
-    if not pend:
-        return False
-    try:
-        if pend['kind'] == 'global':
-            _stage_global_import(message)
-        else:
-            _stage_bot_import(message, pend)
-    except Exception:
-        logger.exception('Import staging failed')
-        bot.reply_to(message, '⚠️ Something went wrong while checking that file. Nothing was changed.')
-    return True
+    for name, ftype in info['scripts']:
+        save_user_file(owner_id, name, ftype)
+    return {'pre_path': pre_path, 'stopped': stopped, 'written': written}
 
 
 def import_confirm_callback(call):
     uid = call.from_user.id
     if call.data == 'impc_cancel':
-        with IMPORT_LOCK:
-            PENDING_IMPORT_WAIT.pop(uid, None)
+        _discard_wait(uid)
         bot.answer_callback_query(call.id, 'Cancelled.')
-        _edit_or_send(call, '❌ Import cancelled. Nothing was changed.')
+        _edit_or_send(call, '❌ Cancelled. Nothing was changed.')
+        return
+    if call.data == 'impc_done':
+        _finish_parts(call)
         return
     try:
         _, action, token = call.data.split('_', 2)
@@ -2060,7 +2436,7 @@ def import_confirm_callback(call):
         _expire_pending_imports()
         entry = PENDING_IMPORT_CONFIRM.get(token)
         if not entry:
-            bot.answer_callback_query(call.id, '⚠️ This request expired. Start the import again.', show_alert=True)
+            bot.answer_callback_query(call.id, '⚠️ This request expired. Start the restore again.', show_alert=True)
             return
         if entry['user_id'] != uid:
             bot.answer_callback_query(call.id, '⚠️ This is not your request.', show_alert=True)
@@ -2069,74 +2445,125 @@ def import_confirm_callback(call):
     try:
         if action != 'yes':
             bot.answer_callback_query(call.id, 'Cancelled.')
-            _edit_or_send(call, '❌ Import cancelled. Nothing was changed.')
+            _edit_or_send(call, '❌ Cancelled. Nothing was changed.')
             return
-        bot.answer_callback_query(call.id, 'Importing...')
-        if entry['kind'] == 'global':
-            _confirm_global_import(call, entry)
-        else:
-            _confirm_bot_import(call, entry)
+        if not BACKUP_OP_LOCK.acquire(blocking=False):
+            with IMPORT_LOCK:                 # keep the staged restore so the same button can be tapped again
+                PENDING_IMPORT_CONFIRM[token] = entry
+            entry = {}
+            bot.answer_callback_query(call.id, '⏳ Another backup or restore is running. Tap Yes again in a minute.', show_alert=True)
+            return
+        try:
+            bot.answer_callback_query(call.id, 'Restoring...')
+            _edit_or_send(call, '⏳ Restoring... please wait, this can take a minute.')
+            if entry['kind'] == 'full':
+                _confirm_full_restore(call, entry)
+            else:
+                _confirm_user_restore(call, entry)
+        finally:
+            BACKUP_OP_LOCK.release()
     finally:
         _rmtree_quiet(entry.get('dir'))
 
 
-def _confirm_global_import(call, entry):
+def _finish_parts(call):
     uid = call.from_user.id
-    if not _can_import_global(uid):
-        _edit_or_send(call, '⚠️ Only the owner can import the database. Nothing was changed.')
+    with IMPORT_LOCK:
+        pend = PENDING_IMPORT_WAIT.get(uid)
+    if not pend or not pend.get('parts'):
+        bot.answer_callback_query(call.id, '⚠️ No parts received yet. Send the backup file(s) first.', show_alert=True)
+        return
+    if not _wait_permission_ok(uid, pend):
+        _discard_wait(uid)
+        bot.answer_callback_query(call.id, '⚠️ You are not allowed to do this restore.', show_alert=True)
         return
     try:
-        backup_path, missing = _apply_global_import(entry['path'])
-    except Exception as exc:
-        logger.exception('Database import failed')
-        _edit_or_send(call, ('❌ Import failed, the live database was not replaced.\n'
-                             f'<code>{html_escape(str(exc)[:300])}</code>'))
+        zip_path, problem = _assemble_parts(pend)
+    except OSError:
+        zip_path, problem = None, 'I could not join the parts.'
+    if not zip_path:
+        bot.answer_callback_query(call.id, f'⚠️ {problem}', show_alert=True)
         return
-    logger.warning("Hosting database replaced by import (admin %s); backup at %s", uid, backup_path)
-    text = ('✅ <b>Database imported.</b>\n'
-            f'Now live: {len(active_users)} users, {sum(len(v) for v in user_files.values())} scripts, '
-            f'{len(user_subscriptions)} subscriptions, {len(admin_ids)} admins.\n'
-            'The previous database was backed up automatically and is attached below.')
-    if missing:
-        text += (f'\n\nNote: {missing} script(s) in the restored list are not on disk in this server\'s upload folder. '
-                 'The database brings back records, not the script files themselves.')
-    _edit_or_send(call, text)
+    with IMPORT_LOCK:
+        PENDING_IMPORT_WAIT.pop(uid, None)
+    bot.answer_callback_query(call.id, 'Checking the backup...')
+    _stage_backup(call.message.chat.id, uid, pend, zip_path)
+
+
+def _send_safety_backup(chat_id, pre_path, caption):
+    if not pre_path:
+        return
     try:
-        with open(backup_path, 'rb') as backup_file:
-            bot.send_document(call.message.chat.id, backup_file,
-                              caption='Backup of the database as it was before this import.')
+        base = os.path.splitext(os.path.basename(pre_path))[0]
+        sent = _send_backup_file(chat_id, pre_path, base, caption)
+        if not sent:
+            _say(chat_id, 'The safety backup is too big for Telegram; it is kept on the server '
+                          f'(<code>{html_escape(os.path.relpath(pre_path, BASE_DIR))}</code>).')
     except Exception:
-        logger.exception('Could not send the pre-import backup')
+        logger.exception('Could not send the safety backup')
 
 
-def _confirm_bot_import(call, entry):
+def _confirm_full_restore(call, entry):
     uid = call.from_user.id
-    owner_id, file_name = entry['owner'], entry['file']
-    if not _may_manage_bot_data(uid, owner_id) or not any(item[0] == file_name for item in user_files.get(owner_id, [])):
-        _edit_or_send(call, '⚠️ You can only import data for your own bots. Nothing was changed.')
-        return
-    if _any_script_running(owner_id):
-        _edit_or_send(call, '⚠️ One of your bots is running. Stop your bots and start the import again. Nothing was changed.')
+    if not _can_backup_global(uid):
+        _edit_or_send(call, '⚠️ Only the owner can restore the full backup. Nothing was changed.')
         return
     try:
-        written, backup_path = _apply_bot_import(entry)
+        result = _apply_full_restore(entry)
     except Exception as exc:
-        logger.exception('Bot data import failed')
-        _edit_or_send(call, ('❌ Import failed. Some files may not have been replaced; your previous data '
-                             'is in the backup if one was made.\n'
+        logger.exception('Full restore failed')
+        _edit_or_send(call, ('❌ Restore failed. The database and user folders were put back the way they were.\n'
                              f'<code>{html_escape(str(exc)[:300])}</code>'))
         return
-    logger.info("Bot data imported: user=%s script=%s files=%s", owner_id, file_name, written)
-    _edit_or_send(call, (f'✅ <b>Data imported</b> for <code>{html_escape(file_name)}</code>: '
-                         f'{written} file(s) restored.\nStart your bot again to use it.'
-                         + ('\nYour previous data was backed up and is attached below.' if backup_path else '')))
-    if backup_path:
-        try:
-            with open(backup_path, 'rb') as backup_file:
-                bot.send_document(call.message.chat.id, backup_file,
-                                  caption='Backup of your data as it was before this import.')
-        except Exception:
-            logger.exception('Could not send the pre-import data backup')
+    logger.warning("Full backup restored by admin %s; safety backup at %s", uid, result['pre_path'])
+    info = entry['info']
+    lines = ['✅ <b>Full backup restored.</b>',
+             f'• Database: {len(active_users)} users, {sum(len(v) for v in user_files.values())} scripts, '
+             f'{len(user_subscriptions)} subscriptions, {len(admin_ids)} admins',
+             f'• Bots and data: {len(info["users"])} user folder(s), {info["files"]} files, each back in its own user\'s folder']
+    status = result['source_status']
+    if status == 'replaced':
+        lines.append(f'• Bot code: <code>{html_escape(result["source_name"])}</code> replaced on disk '
+                     '(old copy kept as .bak). <b>Restart the bot to start using it.</b>')
+    elif status == 'same':
+        lines.append('• Bot code: identical to the running one, nothing to change.')
+    elif status == 'saved_aside':
+        lines.append(f'• Bot code: could not overwrite the running file, so it was saved as '
+                     f'<code>{html_escape(result["source_name"])}</code> next to it. Swap it in and restart when you are ready.')
+    elif status == 'failed':
+        lines.append('• Bot code: could not be restored (the data parts are fine).')
+    else:
+        lines.append('• Bot code: not in this backup.')
+    if result['stopped']:
+        lines.append(f'• {result["stopped"]} running bot(s) were stopped; start them again from My Files or Run All.')
+    if result['missing']:
+        lines.append(f'• {result["missing"]} script(s) in the list have no file on disk.')
+    lines.append('The state from before the restore was saved and is attached below.')
+    _edit_or_send(call, '\n'.join(lines))
+    _send_safety_backup(call.message.chat.id, result['pre_path'], 'Backup of everything as it was before this restore.')
+
+
+def _confirm_user_restore(call, entry):
+    uid = call.from_user.id
+    owner_id = entry['owner']
+    if not _may_manage_bot_data(uid, owner_id):
+        _edit_or_send(call, '⚠️ You can only restore your own bots. Nothing was changed.')
+        return
+    try:
+        result = _apply_user_restore(entry)
+    except Exception as exc:
+        logger.exception('User restore failed')
+        _edit_or_send(call, ('❌ Restore failed. Some files may not have been replaced; your previous files '
+                             'are in the backup that was made first.\n'
+                             f'<code>{html_escape(str(exc)[:300])}</code>'))
+        return
+    logger.info("User backup restored: owner=%s by=%s files=%s", owner_id, uid, result['written'])
+    text = (f'✅ <b>Your bots were restored</b>: {result["written"]} file(s) are back in your folder '
+            f'and {len(user_files.get(owner_id, []))} bot(s) are listed in My Files.\nStart your bots again to use them.')
+    if result['pre_path']:
+        text += '\nYour previous files were backed up and are attached below.'
+    _edit_or_send(call, text)
+    _send_safety_backup(call.message.chat.id, result['pre_path'], 'Backup of your files as they were before this restore.')
 
 
 def create_control_buttons(script_owner_id, file_name, is_running=True):
@@ -2158,9 +2585,10 @@ def create_control_buttons(script_owner_id, file_name, is_running=True):
         markup.row(
             types.InlineKeyboardButton("📜 View Logs", callback_data=f'logs_{script_owner_id}_{file_name}')
         )
+    markup.row(types.InlineKeyboardButton("🔑 Environment (.env)", callback_data=f'envm_{script_owner_id}_{file_name}'))
     markup.row(
-        types.InlineKeyboardButton("📥 Export Data", callback_data=f'bdx_{script_owner_id}_{file_name}'),
-        types.InlineKeyboardButton("📤 Import Data", callback_data=f'bdi_{script_owner_id}_{file_name}')
+        types.InlineKeyboardButton("📦 Export My Bots", callback_data=f'ubk_{script_owner_id}'),
+        types.InlineKeyboardButton("♻️ Import My Bots", callback_data=f'ubr_{script_owner_id}')
     )
     markup.add(types.InlineKeyboardButton("🔙 Back to Files", callback_data='check_files'))
     return markup
@@ -2174,8 +2602,8 @@ def create_admin_panel():
     markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
     markup.row(types.InlineKeyboardButton('🗄 Database Backup', callback_data='database_backup'),
                types.InlineKeyboardButton('📤 Export Users', callback_data='export_users'))
-    markup.row(types.InlineKeyboardButton('📥 Export Database', callback_data='export_database'),
-               types.InlineKeyboardButton('📤 Import Database', callback_data='import_database'))
+    markup.row(types.InlineKeyboardButton('📦 Export Full Backup', callback_data='export_database'),
+               types.InlineKeyboardButton('♻️ Import Full Backup', callback_data='import_database'))
     markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
     return markup
 
@@ -2418,6 +2846,229 @@ def process_zip_file(zip_path, user_id, user_folder, file_name_zip, message, tem
             try: shutil.rmtree(temp_dir); logger.info(f"Cleaned temp dir: {temp_dir}")
             except Exception as e: logger.error(f"Failed to clean temp dir {temp_dir}: {e}", exc_info=True)
 
+# --- Per-bot environment variables (.env style) -------------------------------------
+# Each bot keeps its variables in "<bot file name>.env" next to the script, inside the user's own folder
+# (for example bot.py.env). The file is a normal part of that folder, so My Bots export / import and full
+# backups carry it along. It is read every time the bot is launched (first start, Restart button, watchdog).
+ENV_KEY_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,39}$')
+ENV_MAX_VARS = 40
+ENV_MAX_VALUE_CHARS = 2000
+ENV_MAX_FILE_BYTES = 128 * 1024
+# Names that change how the interpreter / loader itself behaves; they could be used to get around the upload review.
+ENV_RESERVED_KEYS = frozenset({
+    'PATH', 'HOME', 'USER', 'SHELL', 'IFS', 'ENV', 'BASH_ENV', 'PWD', 'TMPDIR',
+    'PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP', 'PYTHONINSPECT', 'PYTHONSAFEPATH', 'PYTHONUSERBASE',
+    'PYTHONBREAKPOINT', 'PYTHONEXECUTABLE', 'NODE_OPTIONS', 'NODE_PATH', 'NODE_EXTRA_CA_CERTS',
+    'NPM_CONFIG_PREFIX', 'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE',
+})
+ENV_RESERVED_PREFIXES = ('LD_', 'DYLD_')
+ENV_LOCK = threading.RLock()
+_ENV_SENSITIVE_RE = re.compile(r'TOKEN|SECRET|PASS|KEY|HASH|AUTH|CRED|PRIVATE|SESSION|DSN|URL|URI|COOKIE', re.IGNORECASE)
+
+
+def _env_key_reserved(key):
+    upper = key.upper()
+    return upper in ENV_RESERVED_KEYS or upper.startswith(ENV_RESERVED_PREFIXES)
+
+
+def _env_safe_label(text, limit=30):
+    """A piece of user input that is safe to show back (printable ASCII only, shortened, no values)."""
+    return re.sub(r'[^\x21-\x7e]', '?', str(text))[:limit]
+
+
+def bot_env_path(user_folder, file_name):
+    """Where the variables of one bot live; None when the name is not a plain file name."""
+    if not file_name or file_name != os.path.basename(file_name) or file_name in ('.', '..') or '\\' in file_name:
+        return None
+    return os.path.join(user_folder, file_name + '.env')
+
+
+def _parse_env_value(raw):
+    """Value part of a KEY=VALUE line -> (value, error). Understands "double", 'single' and unquoted values."""
+    raw = raw.strip()
+    if not raw:
+        return '', None
+    quote = raw[0]
+    if quote in ('"', "'"):
+        out = []
+        i = 1
+        escapes = {'n': '\n', 'r': '\r', 't': '\t', '"': '"', '\\': '\\'}
+        while i < len(raw):
+            ch = raw[i]
+            if quote == '"' and ch == '\\' and i + 1 < len(raw):
+                nxt = raw[i + 1]
+                out.append(escapes.get(nxt, '\\' + nxt))
+                i += 2
+                continue
+            if ch == quote:
+                rest = raw[i + 1:].strip()
+                if rest and not rest.startswith('#'):
+                    return None, 'there is text after the closing quote'
+                return ''.join(out), None
+            out.append(ch)
+            i += 1
+        return None, 'the quote is not closed'
+    match = re.search(r'\s#', raw)       # unquoted values may end with a " # comment"
+    if match:
+        raw = raw[:match.start()]
+    return raw.strip(), None
+
+
+def parse_env_text(text):
+    """Parse .env style text. Returns (pairs, problems): pairs is {KEY: value}; problems is a list of
+    (line number, key label or None, reason). Values are never put into problems."""
+    pairs = {}
+    problems = []
+    text = (text or '').lstrip('\ufeff')
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if re.match(r'export\s', stripped):
+            stripped = stripped[6:].lstrip()
+        if '=' not in stripped:
+            problems.append((number, None, 'needs the form KEY=VALUE'))
+            continue
+        key, _, raw_value = stripped.partition('=')
+        key = key.strip()
+        label = _env_safe_label(key)
+        if not ENV_KEY_RE.match(key):
+            problems.append((number, label, 'name can only use letters, digits and _ (not starting with a digit, max 40 characters)'))
+            continue
+        if _env_key_reserved(key):
+            problems.append((number, key, 'this name is reserved by the host and cannot be changed'))
+            continue
+        value, error = _parse_env_value(raw_value)
+        if error:
+            problems.append((number, key, error))
+            continue
+        if len(value) > ENV_MAX_VALUE_CHARS:
+            problems.append((number, key, f'value is longer than {ENV_MAX_VALUE_CHARS} characters'))
+            continue
+        if any((ord(ch) < 32 and ch not in '\t\n\r') or ch == '\x7f' for ch in value):
+            problems.append((number, key, 'value has unsupported control characters'))
+            continue
+        pairs[key] = value
+    return pairs, problems
+
+
+def _format_env_value(value):
+    if re.fullmatch(r'[A-Za-z0-9_@%+=:,./-]*', value):
+        return value
+    escaped = value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+    return f'"{escaped}"'
+
+
+def serialize_env(env):
+    return ''.join(f'{key}={_format_env_value(value)}\n' for key, value in sorted(env.items()))
+
+
+def load_bot_env(user_folder, file_name):
+    """Saved variables of one bot as a plain dict. Never raises: a missing or broken file simply gives {}.
+    Anything that is not a valid, allowed name is dropped here as well, so a hand-made file or a restored
+    backup cannot smuggle in reserved names."""
+    try:
+        path = bot_env_path(user_folder, file_name)
+        if not path or os.path.islink(path) or not os.path.isfile(path):
+            return {}
+        if os.path.getsize(path) > ENV_MAX_FILE_BYTES:
+            logger.warning("Environment file for %s is too large and was ignored.", file_name)
+            return {}
+        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+            pairs, problems = parse_env_text(handle.read())
+        if problems:
+            logger.warning("Environment file for %s: %d line(s) ignored.", file_name, len(problems))
+        return dict(list(pairs.items())[:ENV_MAX_VARS])
+    except Exception as exc:
+        logger.warning("Could not read the environment of %s: %s", file_name, redact_secrets(exc))
+        return {}
+
+
+def _write_bot_env(path, env):
+    """Atomic write (owner-only permissions). An empty set removes the file."""
+    if not env:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        return
+    data = serialize_env(env)
+    if len(data.encode('utf-8')) > ENV_MAX_FILE_BYTES:
+        raise ValueError('The environment is too large.')
+    tmp_path = f'{path}.{os.urandom(4).hex()}.tmp'
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
+            handle.write(data)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def update_bot_env(user_folder, file_name, new_pairs):
+    """Add or update variables. Returns (added keys, updated keys, unchanged keys). Raises ValueError with a
+    plain message when the result would be too big or the name is unusable."""
+    path = bot_env_path(user_folder, file_name)
+    if not path:
+        raise ValueError('That bot name cannot have variables.')
+    with ENV_LOCK:
+        current = load_bot_env(user_folder, file_name)
+        merged = dict(current)
+        added, updated, unchanged = [], [], []
+        for key, value in new_pairs.items():
+            if key not in current:
+                added.append(key)
+            elif current[key] != value:
+                updated.append(key)
+            else:
+                unchanged.append(key)
+            merged[key] = value
+        if len(merged) > ENV_MAX_VARS:
+            raise ValueError(f'A bot can have at most {ENV_MAX_VARS} variables '
+                             f'(you have {len(current)}, this would make {len(merged)}). Delete some first.')
+        _write_bot_env(path, merged)
+    return added, updated, unchanged
+
+
+def delete_bot_env_key(user_folder, file_name, key):
+    path = bot_env_path(user_folder, file_name)
+    if not path:
+        return False
+    with ENV_LOCK:
+        current = load_bot_env(user_folder, file_name)
+        if key not in current:
+            return False
+        del current[key]
+        _write_bot_env(path, current)
+    return True
+
+
+def clear_bot_env(user_folder, file_name):
+    """Remove every saved variable of one bot. Returns how many were set."""
+    path = bot_env_path(user_folder, file_name)
+    if not path:
+        return 0
+    with ENV_LOCK:
+        count = len(load_bot_env(user_folder, file_name))
+        _write_bot_env(path, {})
+    return count
+
+
+def _env_key_tag(key):
+    return hashlib.sha1(key.encode('utf-8')).hexdigest()[:6]
+
+
+def _env_display_value(key, value, reveal):
+    shown = value.replace('\r', ' ').replace('\n', ' ')
+    if not reveal and _ENV_SENSITIVE_RE.search(key):
+        return (shown[:3] + '••••') if len(shown) > 8 else '••••'
+    return shown if len(shown) <= 24 else shown[:24] + '…'
+
+
 def _prepare_log_file(log_file_path):
     """Open a script log for appending; start a fresh file if the old one is already too big."""
     try:
@@ -2428,9 +3079,14 @@ def _prepare_log_file(log_file_path):
     return open(log_file_path, 'a', encoding='utf-8', errors='ignore')
 
 
-def _popen_kwargs():
-    """Extra Popen arguments: own process group on POSIX (so children can be stopped too) and a clean environment."""
-    kwargs = {'env': child_env()}
+def _popen_kwargs(user_folder=None, file_name=None):
+    """Extra Popen arguments: own process group on POSIX (so children can be stopped too) and a clean environment.
+    With user_folder + file_name, the variables saved for that one bot (Environment button) are merged in.
+    Only the dict handed to this one child is changed; the hosting bot's own os.environ is never touched."""
+    env = child_env()
+    if user_folder and file_name:
+        env.update(load_bot_env(user_folder, file_name))
+    kwargs = {'env': env}
     if os.name == 'posix':
         kwargs['start_new_session'] = True
     return kwargs
@@ -2521,7 +3177,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
             logger.info(f"Running Python pre-check: {' '.join(check_command)}")
             check_proc = None
             try:
-                check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='ignore', **_popen_kwargs())
+                check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='ignore', **_popen_kwargs(user_folder, file_name))
                 stdout, stderr = check_proc.communicate(timeout=5)
                 return_code = check_proc.returncode
                 logger.info(f"Python Pre-check early. RC: {return_code}. Stderr: {stderr[:200]}...")
@@ -2572,7 +3228,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         try:
             process = subprocess.Popen(
                 [sys.executable, '-u', script_path], cwd=user_folder, stdout=log_file, stderr=log_file,
-                stdin=subprocess.PIPE, encoding='utf-8', errors='ignore', **_popen_kwargs()
+                stdin=subprocess.PIPE, encoding='utf-8', errors='ignore', **_popen_kwargs(user_folder, file_name)
             )
             logger.info(f"Started Python process {process.pid} for {script_key}")
             _register_script(script_key, {
@@ -2629,7 +3285,7 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
             logger.info(f"Running JS pre-check: {' '.join(check_command)}")
             check_proc = None
             try:
-                check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='ignore', **_popen_kwargs())
+                check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='ignore', **_popen_kwargs(user_folder, file_name))
                 stdout, stderr = check_proc.communicate(timeout=5)
                 return_code = check_proc.returncode
                 logger.info(f"JS Pre-check early. RC: {return_code}. Stderr: {stderr[:200]}...")
@@ -2682,7 +3338,7 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
         try:
             process = subprocess.Popen(
                 ['node', script_path], cwd=user_folder, stdout=log_file, stderr=log_file,
-                stdin=subprocess.PIPE, encoding='utf-8', errors='ignore', **_popen_kwargs()
+                stdin=subprocess.PIPE, encoding='utf-8', errors='ignore', **_popen_kwargs(user_folder, file_name)
             )
             logger.info(f"Started JS process {process.pid} for {script_key}")
             _register_script(script_key, {
@@ -3449,6 +4105,7 @@ def handle_callbacks(call):
         elif data.startswith('restart_'): restart_bot_callback(call)
         elif data.startswith('delete_'): delete_bot_callback(call)
         elif data.startswith('logs_'): logs_bot_callback(call)
+        elif data.startswith(('envm_', 'envv_', 'enva_', 'envd_', 'envk_', 'envc_', 'envy_')): env_callback(call)
         elif data == 'speed': speed_callback(call)
         elif data == 'user_account': user_account_callback(call)
         elif data == 'my_running': my_running_callback(call)
@@ -3456,11 +4113,11 @@ def handle_callbacks(call):
         elif data == 'admin_dashboard': admin_required_callback(call, admin_dashboard_callback)
         elif data == 'database_backup': admin_required_callback(call, database_backup_callback)
         elif data == 'export_users': admin_required_callback(call, export_users_callback)
-        elif data == 'export_database': admin_required_callback(call, export_database_callback)
-        elif data == 'import_database': admin_required_callback(call, import_database_callback)
+        elif data == 'export_database': admin_required_callback(call, full_backup_callback)
+        elif data == 'import_database': admin_required_callback(call, full_restore_callback)
         elif data.startswith('impc_'): import_confirm_callback(call)
-        elif data.startswith('bdx_'): export_bot_data_callback(call)
-        elif data.startswith('bdi_'): import_bot_data_init_callback(call)
+        elif data.startswith('ubk_'): user_backup_callback(call)
+        elif data.startswith('ubr_'): user_restore_callback(call)
         elif data == 'back_to_main': back_to_main_callback(call)
         elif data.startswith('confirm_broadcast_'): handle_confirm_broadcast(call)
         elif data == 'cancel_broadcast': handle_cancel_broadcast(call)
@@ -3635,8 +4292,8 @@ def admin_dashboard_callback(call):
            types.InlineKeyboardButton('💳 Subscriptions', callback_data='subscription'))
     kb.row(types.InlineKeyboardButton('🗄 Database Backup', callback_data='database_backup'),
            types.InlineKeyboardButton('📤 Export Users', callback_data='export_users'))
-    kb.row(types.InlineKeyboardButton('📥 Export Database', callback_data='export_database'),
-           types.InlineKeyboardButton('📤 Import Database', callback_data='import_database'))
+    kb.row(types.InlineKeyboardButton('📦 Export Full Backup', callback_data='export_database'),
+           types.InlineKeyboardButton('♻️ Import Full Backup', callback_data='import_database'))
     kb.row(types.InlineKeyboardButton('⚙️ Settings', callback_data='admin_settings'),
            types.InlineKeyboardButton('👑 Admins', callback_data='admin_panel'))
     kb.add(types.InlineKeyboardButton('🏠 Main Menu', callback_data='back_to_main'))
@@ -3771,8 +4428,9 @@ def check_files_callback(call):
         bot.answer_callback_query(call.id, "⚠️ No files uploaded.", show_alert=True)
         try:
             markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("♻️ Import My Bots (from backup)", callback_data=f'ubr_{user_id}'))
             markup.add(types.InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main'))
-            bot.edit_message_text("📂 Your files:\n\n(No files uploaded)", chat_id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text("📂 Your files:\n\n(No files uploaded)\nHave a backup? Tap Import My Bots.", chat_id, call.message.message_id, reply_markup=markup)
         except Exception as e: logger.error(f"Error editing msg for empty file list: {e}")
         return
     bot.answer_callback_query(call.id) 
@@ -3783,9 +4441,11 @@ def check_files_callback(call):
         btn_text = f"{file_name} ({file_type}) - {status_icon}"
         # Callback includes user_id as script_owner_id
         markup.add(types.InlineKeyboardButton(btn_text, callback_data=f'file_{user_id}_{file_name}'))
+    markup.row(types.InlineKeyboardButton("📦 Export My Bots", callback_data=f'ubk_{user_id}'),
+               types.InlineKeyboardButton("♻️ Import My Bots", callback_data=f'ubr_{user_id}'))
     markup.add(types.InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main'))
     try:
-        bot.edit_message_text("📂 Your files:\nClick to manage.", chat_id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+        bot.edit_message_text("📂 Your files:\nClick to manage, or back up all your bots and their data.", chat_id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
     except telebot.apihelper.ApiTelegramException as e:
          if "message is not modified" in str(e): logger.warning("Msg not modified (files).")
          else: logger.error(f"Error editing msg for file list: {e}")
@@ -4062,6 +4722,7 @@ def delete_bot_callback(call):
         user_folder = get_user_folder(script_owner_id)
         file_path = os.path.join(user_folder, file_name)
         log_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
+        env_path = bot_env_path(user_folder, file_name)
         deleted_disk = []
         if os.path.exists(file_path):
             try: os.remove(file_path); deleted_disk.append(file_name); logger.info(f"Deleted file: {file_path}")
@@ -4069,6 +4730,10 @@ def delete_bot_callback(call):
         if os.path.exists(log_path):
             try: os.remove(log_path); deleted_disk.append(os.path.basename(log_path)); logger.info(f"Deleted log: {log_path}")
             except OSError as e: logger.error(f"Error deleting log {log_path}: {e}")
+
+        if env_path and os.path.isfile(env_path):
+            try: os.remove(env_path); deleted_disk.append(os.path.basename(env_path)); logger.info(f"Deleted environment file: {env_path}")
+            except OSError as e: logger.error(f"Error deleting {env_path}: {e}")
 
         remove_user_file_db(script_owner_id, file_name)
         deleted_str = ", ".join(f"`{f}`" for f in deleted_disk) if deleted_disk else "associated files"
@@ -4137,6 +4802,229 @@ def logs_bot_callback(call):
     except Exception as e:
         logger.error(f"Error in logs_bot_callback for '{call.data}': {e}", exc_info=True)
         bot.answer_callback_query(call.id, "Error fetching logs.", show_alert=True)
+
+# --- Environment (.env) button: per-bot control panel ----------------------------
+def _env_panel(owner_id, file_name, reveal=False):
+    """Text + buttons of the Environment panel for one bot."""
+    user_folder = get_user_folder(owner_id)
+    env = load_bot_env(user_folder, file_name)
+    lines = [f"🔑 <b>Environment</b> for <code>{html_escape(file_name)}</code> (User <code>{owner_id}</code>)",
+             f"Saved variables: {len(env)}/{ENV_MAX_VARS}", ""]
+    if env:
+        shown = []
+        for key in sorted(env):
+            shown.append(f"<code>{html_escape(key)}</code> = <code>{html_escape(_env_display_value(key, env[key], reveal))}</code>")
+        text_tail = ("\n\nValues that look secret are partly hidden. Tap <b>Show Values</b> to see everything."
+                     if not reveal else "\n\nShowing full values. Do not forward this message.")
+        footer = text_tail + "\nChanges are used the next time this bot starts or restarts."
+        body = "\n".join(shown)
+        limit = 3800 - len("\n".join(lines)) - len(footer)
+        if len(body) > limit:
+            cut = body[:limit].rsplit("\n", 1)[0]
+            body = cut + "\n…(more not shown)"
+        lines.append(body)
+        lines.append(footer)
+    else:
+        lines.append("No variables yet. Tap <b>Add / Update</b> and send them like a .env file, for example <code>BOT_TOKEN=123:abc</code>.")
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(types.InlineKeyboardButton("➕ Add / Update", callback_data=f'enva_{owner_id}_{file_name}'),
+               types.InlineKeyboardButton("🗑 Delete One", callback_data=f'envd_{owner_id}_{file_name}') if env else
+               types.InlineKeyboardButton("🔄 Refresh", callback_data=f'envm_{owner_id}_{file_name}'))
+    if env:
+        view_btn = (types.InlineKeyboardButton("🙈 Hide Values", callback_data=f'envm_{owner_id}_{file_name}') if reveal
+                    else types.InlineKeyboardButton("👁 Show Values", callback_data=f'envv_{owner_id}_{file_name}'))
+        markup.row(view_btn, types.InlineKeyboardButton("🧹 Clear All", callback_data=f'envc_{owner_id}_{file_name}'))
+    if is_bot_running(owner_id, file_name):
+        markup.row(types.InlineKeyboardButton("🔄 Restart Now (apply changes)", callback_data=f'restart_{owner_id}_{file_name}'))
+    markup.row(types.InlineKeyboardButton("🔙 Back to Controls", callback_data=f'file_{owner_id}_{file_name}'))
+    return "\n".join(lines), markup
+
+
+def _env_show_panel(call, owner_id, file_name, reveal=False):
+    text, markup = _env_panel(owner_id, file_name, reveal)
+    _edit_or_send(call, text, markup)
+
+
+def _env_access_ok(call, owner_id, file_name):
+    """Same rule as the other per-bot buttons: the bot's owner or an admin, and the bot must exist."""
+    uid = call.from_user.id
+    if not (uid == owner_id or uid in admin_ids):
+        bot.answer_callback_query(call.id, "⚠️ You can only manage the environment of your own bots.", show_alert=True)
+        return False
+    if not any(item[0] == file_name for item in user_files.get(owner_id, [])):
+        bot.answer_callback_query(call.id, "⚠️ File not found.", show_alert=True)
+        return False
+    if getattr(call.message.chat, 'type', 'private') != 'private':
+        bot.answer_callback_query(call.id, "🔒 Open this in a private chat with me, so your secrets stay private.", show_alert=True)
+        return False
+    return True
+
+
+def env_callback(call):
+    """All buttons of the Environment panel (callback prefixes envm_ envv_ enva_ envd_ envk_ envc_ envy_)."""
+    try:
+        action = call.data.split('_', 1)[0]
+        key_tag = None
+        if action == 'envk':
+            _, owner_str, key_tag, file_name = call.data.split('_', 3)
+        else:
+            _, owner_str, file_name = call.data.split('_', 2)
+        owner_id = int(owner_str)
+    except (ValueError, IndexError):
+        bot.answer_callback_query(call.id, "Error: Invalid action data.", show_alert=True)
+        return
+    try:
+        if not _env_access_ok(call, owner_id, file_name):
+            return
+        chat_id = call.message.chat.id
+        user_folder = get_user_folder(owner_id)
+        bot.clear_step_handler_by_chat_id(chat_id)   # leaving a half-finished "send variables" step
+        if action in ('envm', 'envv'):
+            bot.answer_callback_query(call.id)
+            _env_show_panel(call, owner_id, file_name, reveal=(action == 'envv'))
+        elif action == 'enva':
+            bot.answer_callback_query(call.id)
+            prompt = (f"➕ <b>Add / update variables</b> for <code>{html_escape(file_name)}</code>\n\n"
+                      "Send me one line:\n<pre>KEY=VALUE</pre>"
+                      "or several lines, like the inside of a .env file (you can also upload the .env file itself):\n"
+                      "<pre>BOT_TOKEN=123456:abcdef\nADMIN_ID=12345\nDEBUG=true</pre>"
+                      "A name that already exists is updated, new names are added. Lines starting with # are ignored. "
+                      "If a value has spaces, put it in quotes.\n"
+                      "I delete your message after saving so the secrets do not stay in the chat.")
+            markup = types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton("❌ Cancel", callback_data=f'envm_{owner_id}_{file_name}'))
+            _edit_or_send(call, prompt, markup)
+            bot.register_next_step_handler(call.message, _env_receive_input, owner_id, file_name, call.from_user.id)
+        elif action == 'envd':
+            env = load_bot_env(user_folder, file_name)
+            bot.answer_callback_query(call.id)
+            if not env:
+                _env_show_panel(call, owner_id, file_name)
+                return
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(*[types.InlineKeyboardButton(f"🗑 {key}", callback_data=f'envk_{owner_id}_{_env_key_tag(key)}_{file_name}')
+                         for key in sorted(env)])
+            markup.row(types.InlineKeyboardButton("🔙 Back", callback_data=f'envm_{owner_id}_{file_name}'))
+            _edit_or_send(call, f"🗑 Which variable of <code>{html_escape(file_name)}</code> should be deleted?", markup)
+        elif action == 'envk':
+            env = load_bot_env(user_folder, file_name)
+            key = next((k for k in env if _env_key_tag(k) == key_tag), None)
+            if key and delete_bot_env_key(user_folder, file_name, key):
+                bot.answer_callback_query(call.id, f"🗑 {key} deleted.")
+            else:
+                bot.answer_callback_query(call.id, "That variable is already gone.")
+            _env_show_panel(call, owner_id, file_name)
+        elif action == 'envc':
+            bot.answer_callback_query(call.id)
+            markup = types.InlineKeyboardMarkup()
+            markup.row(types.InlineKeyboardButton("✅ Yes, delete all", callback_data=f'envy_{owner_id}_{file_name}'),
+                       types.InlineKeyboardButton("❌ No", callback_data=f'envm_{owner_id}_{file_name}'))
+            _edit_or_send(call, f"🧹 Delete <b>all</b> variables of <code>{html_escape(file_name)}</code>?", markup)
+        elif action == 'envy':
+            count = clear_bot_env(user_folder, file_name)
+            bot.answer_callback_query(call.id, f"🧹 {count} variable(s) deleted.")
+            _env_show_panel(call, owner_id, file_name)
+        else:
+            bot.answer_callback_query(call.id, "Unknown action.")
+    except Exception as exc:
+        logger.error("Error in env_callback for '%s': %s", call.data, redact_secrets(exc), exc_info=True)
+        try:
+            bot.answer_callback_query(call.id, "An error occurred.", show_alert=True)
+        except Exception:
+            pass
+
+
+def _env_forget_message(message):
+    """Best effort: remove the message that carried the secrets (works in private chats)."""
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+        return True
+    except Exception:
+        return False
+
+
+def _env_receive_input(message, owner_id, file_name, expected_uid):
+    """Next message after Add / Update: text lines, or an uploaded .env file."""
+    chat_id = message.chat.id
+    uid = message.from_user.id if message.from_user else None
+    try:
+        if uid != expected_uid:
+            return
+        text = message.text if message.content_type == 'text' else None
+        # A command or a menu button means the user moved on: hand it back to the normal handlers.
+        if text and (text.startswith('/') or text in BUTTON_TEXT_TO_LOGIC):
+            bot.process_new_messages([message])
+            return
+        if is_user_banned(uid) or not (uid == owner_id or uid in admin_ids) \
+                or not any(item[0] == file_name for item in user_files.get(owner_id, [])):
+            bot.send_message(chat_id, "⚠️ That bot is not available for you any more. Nothing was changed.")
+            return
+        if message.content_type == 'document':
+            doc = message.document
+            if (doc.file_size or 0) > ENV_MAX_FILE_BYTES:
+                bot.send_message(chat_id, f"❌ That file is too big for an environment file (max {ENV_MAX_FILE_BYTES // 1024} KB). Nothing was changed.")
+                return
+            raw = bot.download_file(bot.get_file(doc.file_id).file_path)
+            if len(raw) > ENV_MAX_FILE_BYTES:
+                bot.send_message(chat_id, "❌ That file is too big for an environment file. Nothing was changed.")
+                return
+            try:
+                text = raw.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                bot.send_message(chat_id, "❌ I could not read that file as text. Send a plain text .env file. Nothing was changed.")
+                return
+        elif text is None:
+            bot.send_message(chat_id, "❌ Please send text like KEY=VALUE, or a .env file. Nothing was changed.")
+            return
+        if len(text) > ENV_MAX_FILE_BYTES:
+            bot.send_message(chat_id, "❌ That is too much text. Nothing was changed.")
+            return
+
+        pairs, problems = parse_env_text(text)
+        result = []
+        if pairs:
+            try:
+                added, updated, unchanged = update_bot_env(get_user_folder(owner_id), file_name, pairs)
+            except ValueError as exc:
+                bot.send_message(chat_id, f"❌ {html_escape(str(exc))} Nothing was changed.", parse_mode='HTML',
+                                 reply_markup=_env_back_markup(owner_id, file_name))
+                _env_forget_message(message)
+                return
+            if added:
+                result.append("Added: " + ", ".join(f"<code>{html_escape(k)}</code>" for k in added))
+            if updated:
+                result.append("Updated: " + ", ".join(f"<code>{html_escape(k)}</code>" for k in updated))
+            if unchanged:
+                result.append("Already the same: " + ", ".join(f"<code>{html_escape(k)}</code>" for k in unchanged))
+            head = f"✅ Saved {len(added) + len(updated)} change(s) for <code>{html_escape(file_name)}</code>."
+        else:
+            head = "❌ I found no valid KEY=VALUE line, so nothing was changed."
+        if problems:
+            result.append("Skipped lines:")
+            for number, label, reason in problems[:10]:
+                who = f" (<code>{html_escape(label)}</code>)" if label else ""
+                result.append(f"• line {number}{who}: {html_escape(reason)}")
+            if len(problems) > 10:
+                result.append(f"• …and {len(problems) - 10} more")
+        removed = _env_forget_message(message)
+        tail = "\nYour message was deleted so the secrets do not stay in the chat." if removed else \
+               "\nTip: delete your message yourself so the secrets do not stay in the chat."
+        if pairs:
+            tail += "\nRestart the bot to use the new values."
+        bot.send_message(chat_id, head + ("\n" + "\n".join(result) if result else "") + tail, parse_mode='HTML',
+                         reply_markup=_env_back_markup(owner_id, file_name))
+    except Exception as exc:
+        logger.error("Error saving environment for %s: %s", file_name, redact_secrets(exc), exc_info=True)
+        try:
+            bot.send_message(chat_id, "⚠️ Something went wrong while saving. Please try again.")
+        except Exception:
+            pass
+
+
+def _env_back_markup(owner_id, file_name):
+    return types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton("🔑 Open Environment", callback_data=f'envm_{owner_id}_{file_name}'))
+
 
 def speed_callback(call):
     user_id = call.from_user.id
