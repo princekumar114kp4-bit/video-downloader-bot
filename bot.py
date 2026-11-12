@@ -41,7 +41,7 @@ def _env_int(name, default):
 
 
 # Secret: the token is NEVER stored in the code. Set it in your host's environment.
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '9017009642:AAFp-m_9eibWd_KGJzIxiCnAGFE8JYgnwqs').strip()
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip()
 if not BOT_TOKEN:
     sys.stderr.write(
         "\nERROR: BOT_TOKEN is not set.\n"
@@ -2828,6 +2828,7 @@ def process_zip_file(zip_path, user_id, user_folder, file_name_zip, message, tem
         logger.info(f"Moved {moved_count} items to {user_folder}")
 
         save_user_file(user_id, main_script_name, file_type)
+        _reset_restart_state(user_id, main_script_name)
         logger.info(f"Saved main script '{main_script_name}' ({file_type}) for {user_id} from zip.")
         main_script_path = os.path.join(user_folder, main_script_name)
         bot.reply_to(message, f"✅ Files extracted. Starting main script: `{main_script_name}`...", parse_mode='Markdown')
@@ -3139,6 +3140,7 @@ def _short_code_block(text, limit=500):
 def handle_js_file(file_path, script_owner_id, user_folder, file_name, message):
     try:
         save_user_file(script_owner_id, file_name, 'js')
+        _reset_restart_state(script_owner_id, file_name)
         threading.Thread(target=run_js_script, args=(file_path, script_owner_id, user_folder, file_name, message)).start()
     except Exception as e:
         logger.error(f"❌ Error processing JS file {file_name} for {script_owner_id}: {e}", exc_info=True)
@@ -3147,6 +3149,7 @@ def handle_js_file(file_path, script_owner_id, user_folder, file_name, message):
 def handle_py_file(file_path, script_owner_id, user_folder, file_name, message):
     try:
         save_user_file(script_owner_id, file_name, 'py')
+        _reset_restart_state(script_owner_id, file_name)
         threading.Thread(target=run_script, args=(file_path, script_owner_id, user_folder, file_name, message)).start()
     except Exception as e:
         logger.error(f"❌ Error processing Python file {file_name} for {script_owner_id}: {e}", exc_info=True)
@@ -3725,6 +3728,7 @@ def _logic_run_all_scripts(message_or_call):
                 if os.path.exists(file_path):
                     logger.info(f"Admin {admin_user_id} attempting to start '{file_name}' ({file_type}) for user {target_user_id}.")
                     try:
+                        _reset_restart_state(target_user_id, file_name)
                         if file_type == 'py':
                             threading.Thread(target=run_script, args=(file_path, target_user_id, user_folder, file_name, admin_message_obj_for_script_runner)).start()
                             started_count += 1
@@ -4163,6 +4167,9 @@ def handle_callbacks(call):
         elif data.startswith('reject_file_'): admin_required_callback(call, process_reject_file)
         elif data.startswith('approve_zip_'): admin_required_callback(call, process_approve_zip)
         elif data.startswith('reject_zip_'): admin_required_callback(call, process_reject_zip)
+        # --- Users list paging ---
+        elif data.startswith('users_page_'): handle_users_page(call)
+        elif data == 'noop': bot.answer_callback_query(call.id)
         else:
             bot.answer_callback_query(call.id, "Unknown action.")
             logger.warning(f"Unhandled callback data: {data} from user {user_id}")
@@ -4631,7 +4638,6 @@ def restart_bot_callback(call):
         logger.info(f"Restart: Requester={requesting_user_id}, Owner={script_owner_id}, File='{file_name}'")
         if not (requesting_user_id == script_owner_id or requesting_user_id in admin_ids):
             bot.answer_callback_query(call.id, "⚠️ Permission denied.", show_alert=True); return
-        RESTART_STATE[_script_key(script_owner_id, file_name)] = {"attempts": 0, "manual_stop": False}
 
         user_files_list = user_files.get(script_owner_id, [])
         file_info = next((f for f in user_files_list if f[0] == file_name), None)
@@ -4648,12 +4654,16 @@ def restart_bot_callback(call):
             check_files_callback(call); return
 
         bot.answer_callback_query(call.id, f"⏳ Restarting {file_name} for user {script_owner_id}...")
+        # Mark it as manually stopped while the old process is killed, so the watchdog does not see the
+        # kill as a crash (extra "stopped unexpectedly" message, possible second launch).
+        RESTART_STATE.setdefault(script_key, {"attempts": 0, "manual_stop": False})["manual_stop"] = True
         if is_bot_running(script_owner_id, file_name):
             logger.info(f"Restart: Stopping existing {script_key}...")
             process_info = bot_scripts.get(script_key)
             if process_info: kill_process_tree(process_info)
             _forget_script(script_key)
             time.sleep(1.5) 
+        _reset_restart_state(script_owner_id, file_name)
 
         logger.info(f"Restart: Starting script {script_key}...")
         if file_type == 'py':
@@ -5623,7 +5633,7 @@ def all_users_callback(call):
             bot.edit_message_text("👥 No active users yet.", call.message.chat.id, call.message.message_id)
             return
         
-        users_list = list(active_users)
+        users_list = sorted(active_users)
         chunk_size = 20
         total_pages = (len(users_list) + chunk_size - 1) // chunk_size
         
@@ -5674,7 +5684,6 @@ def display_users_list(chat_id, message_id, users_list, page, total_pages, chunk
     except Exception as e:
         logger.error(f"Error editing users list: {e}")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('users_page_'))
 def handle_users_page(call):
     if call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "⚠️ Admin only.", show_alert=True)
@@ -5682,12 +5691,12 @@ def handle_users_page(call):
     
     try:
         page = int(call.data.split('_')[2])
-        users_list = list(active_users)
+        users_list = sorted(active_users)
         chunk_size = 20
         total_pages = (len(users_list) + chunk_size - 1) // chunk_size
         
+        bot.answer_callback_query(call.id)
         if 0 <= page < total_pages:
-            bot.answer_callback_query(call.id)
             display_users_list(call.message.chat.id, call.message.message_id, users_list, page, total_pages, chunk_size)
     except Exception as e:
         logger.error(f"Error handling users page: {e}", exc_info=True)
@@ -5770,6 +5779,10 @@ def process_remove_user_limit(message):
 # --- Hosting Health & Crash Recovery ---
 def _script_key(owner_id, file_name):
     return f"{int(owner_id)}_{file_name}"
+
+def _reset_restart_state(owner_id, file_name):
+    """A fresh user-initiated launch clears an old manual stop / used-up retries, so auto-restart works again."""
+    RESTART_STATE[_script_key(owner_id, file_name)] = {"attempts": 0, "manual_stop": False}
 
 def _read_cgroup_value(paths):
     """Read the first available cgroup metric without touching /proc."""
@@ -6105,6 +6118,8 @@ def cleanup_files_callback(call):
         cleaned_files = 0
         
         for user_dir in os.listdir(UPLOAD_BOTS_DIR):
+            if user_dir.startswith('.'):
+                continue  # temporary restore folders (.restore_in_*, .restore_old_*) must not be touched
             user_path = os.path.join(UPLOAD_BOTS_DIR, user_dir)
             if os.path.isdir(user_path):
                 # Check if directory is empty
