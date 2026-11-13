@@ -21,6 +21,11 @@ import sys
 import atexit
 import requests
 import hashlib
+import math
+import base64
+import zlib
+import secrets
+from collections import deque
 
 # --- Extra imports added by the upgrade ---
 from logging.handlers import RotatingFileHandler
@@ -414,6 +419,16 @@ def init_db():
                       log TEXT,
                       install_date TEXT)''')
         
+        # Latest upload-scan verdict per hosted file (threat level, score, reasons as JSON).
+        c.execute('''CREATE TABLE IF NOT EXISTS file_scans
+                     (user_id INTEGER, file_name TEXT, level TEXT, score INTEGER,
+                      reasons TEXT, sha256 TEXT, scanned_at TEXT, decision TEXT DEFAULT '',
+                      PRIMARY KEY (user_id, file_name))''')
+        # Uploads waiting for an admin decision (survive a restart).
+        c.execute('''CREATE TABLE IF NOT EXISTS pending_reviews
+                     (token TEXT PRIMARY KEY, user_id INTEGER, file_name TEXT, file_type TEXT,
+                      level TEXT, score INTEGER, reasons TEXT, sha256 TEXT, created REAL,
+                      chat_id INTEGER, msg_id INTEGER, uploader TEXT, admin_msgs TEXT, kind TEXT)''')
         c.execute('INSERT OR IGNORE INTO admins (user_id, added_by, added_date) VALUES (?, ?, ?)', 
                   (OWNER_ID, OWNER_ID, datetime.now().isoformat()))
         if ADMIN_ID != OWNER_ID:
@@ -575,6 +590,1622 @@ def scan_zip_security(zip_path):
         return True, 'No high-impact patterns detected (not a security sandbox)'
     except Exception as exc:
         return False, f'Error scanning archive: {exc}'
+
+# =============================================================================
+# Upload Security Scanner (static analysis only - uploaded code is NEVER run here)
+# =============================================================================
+# How it works, in three auditable layers:
+#   1. DETECTORS  (_PyDetector / _js_detect / _text_rules) turn source code into FINDINGS:
+#                 (rule_id, line, detail).  Detectors never decide a verdict.
+#   2. SCAN_RULES one table: points, minimum level ("floor"), per-rule cap and the plain-language
+#                 sentence shown to people.  Add or tune a rule by editing ONE row.
+#   3. score_findings()  pure function: findings -> {level, score, reasons}.
+#                 level = the higher of (score thresholds, rule floors).
+# To add a detector: append a finding with a rule id from SCAN_RULES. To add a rule: add a row.
+# This is a screening step, not a sandbox: it catches the common dangerous patterns and
+# deliberately sends anything it cannot understand to a human admin.
+
+SCANNER_VERSION = 2
+THREAT_LOW, THREAT_MEDIUM, THREAT_HIGH = 'low', 'medium', 'high'
+THREAT_RANK = {THREAT_LOW: 0, THREAT_MEDIUM: 1, THREAT_HIGH: 2}
+THREAT_BADGE = {THREAT_LOW: '🟢', THREAT_MEDIUM: '🟡', THREAT_HIGH: '🔴'}
+THREAT_NAME = {THREAT_LOW: 'LOW', THREAT_MEDIUM: 'MEDIUM', THREAT_HIGH: 'HIGH'}
+SCAN_MEDIUM_SCORE = 30   # total points that make a file MEDIUM
+SCAN_HIGH_SCORE = 80     # total points that make a file HIGH
+SCAN_MAX_SOURCE_BYTES = 2 * 1024 * 1024   # a single source file bigger than this is not auto-inspected
+SCAN_MAX_ZIP_READ_BYTES = 40 * 1024 * 1024
+M, H = THREAT_MEDIUM, THREAT_HIGH
+
+# rule id -> (points per hit, minimum level or None, max points from this rule, plain-language text)
+SCAN_RULES = {
+    'remote_code':    (100, H, 100, 'It downloads or decodes hidden code and then runs it'),
+    'dyn_exec':       (30, M, 60, 'It runs code that is built while the bot is running (eval / exec / compile / __import__)'),
+    'evasion':        (80, H, 80, 'It builds the names of dangerous functions piece by piece to hide them'),
+    'dyn_access':     (30, M, 30, 'It reaches system functions in a hidden, indirect way'),
+    'os_command':     (30, M, 60, 'It runs system commands (os.system / os.popen / os.exec)'),
+    'subprocess':     (30, M, 60, 'It starts other programs on the server (subprocess)'),
+    'rm_tree':        (15, None, 30, 'It can delete whole folders (shutil.rmtree)'),
+    'file_delete':    (5, None, 15, 'It deletes files (os.remove / os.unlink)'),
+    'raw_socket':     (30, M, 30, 'It opens raw network sockets'),
+    'reverse_shell':  (100, H, 100, 'It looks like a reverse shell (gives someone remote control of the server)'),
+    'host_files':     (40, M, 40, 'It touches the hosting bot\'s own files, database or other users\' folders'),
+    'secret_files':   (50, M, 50, 'It reads secret or system files (passwords, keys, cloud credentials, process memory)'),
+    'other_bots_env': (40, M, 40, 'It looks for other bots\' .env / settings files'),
+    'env_broad':      (30, M, 30, 'It reads ALL environment variables, not just its own settings'),
+    'steal_exfil':    (100, H, 100, 'It collects secrets (tokens / environment / key files) and sends them out'),
+    'self_replicate': (100, H, 100, 'It copies its own code into other places (self-replicating)'),
+    'blocked_cfg':    (10, None, 30, 'It uses a function the hosting rules restrict'),
+    'obfuscated':     (25, M, 25, 'The code is scrambled / obfuscated, so it cannot be checked'),
+    'detach':         (35, M, 35, 'It tries to keep running outside the hosting control (background / detached process)'),
+    'write_outside':  (30, M, 30, 'It writes or changes files outside its own folder'),
+    'path_traversal': (20, None, 20, 'It uses ../ paths that can leave its own folder'),
+    'persistence':    (90, H, 90, 'It tries to install itself permanently on the server (cron, startup files, ssh keys)'),
+    'destructive':    (100, H, 100, 'It contains a destructive command (wipe disk / delete everything)'),
+    'host_power':     (100, H, 100, 'It can shut down or reboot the whole server'),
+    'miner':          (100, H, 100, 'It looks like a crypto-miner'),
+    'container_escape': (100, H, 100, 'It tries to break out of the hosting container / read other processes'),
+    'priv_esc':       (50, M, 50, 'It tries to gain admin (root) powers or change server security'),
+    'kill_procs':     (35, M, 35, 'It can kill other programs running on the server'),
+    'low_level':      (30, M, 30, 'It uses low-level or remote-control tools (ctypes, ssh, keyboard / screen capture)'),
+    'suspicious_net': (15, None, 30, 'It talks to suspicious addresses (raw IPs, tunnels, paste / webhook sites)'),
+    'open_port':      (10, None, 10, 'It opens a network port on the server'),
+    'chmod_exec':     (35, M, 35, 'It makes files executable'),
+    'download_exec':  (100, H, 100, 'It downloads a program, makes it executable and runs it'),
+    'marshal':        (40, M, 40, 'It loads pre-compiled code (marshal), which cannot be read or checked'),
+    'binary':         (40, M, 40, 'The file is not readable text (binary / compiled content)'),
+    'too_big':        (30, M, 30, 'The source file is too large to be checked automatically'),
+    'bundled_libs':   (30, M, 30, 'It contains bundled libraries / environments that cannot be checked'),
+    'compiled_file':  (40, M, 40, 'It contains compiled / executable files'),
+    'install_risk':   (40, M, 40, 'Its install list pulls code from unusual places or runs install scripts'),
+    'shell_script':   (15, None, 15, 'It includes shell scripts'),
+    'unreadable':     (30, M, 30, 'It could not be read properly for checking'),
+}
+
+# --- shared text patterns (applied to string constants in Python, or the whole text in JS / broken Python)
+_RX = re.compile
+_MINER_RX = _RX(r'(?i)xmrig|minerd|cpuminer|ethminer|nicehash|stratum\+(?:tcp|ssl)|cryptonight|supportxmr|nanopool|hashvault|randomx|coinhive')
+_SECRET_FILE_RX = _RX(r'(?i)/etc/(?:shadow|sudoers|gshadow)|\.ssh/|\bid_(?:rsa|ed25519|ecdsa|dsa)\b|\.aws/credentials|\.git-credentials|\.netrc\b|\.docker/config|\.kube/config|\.bash_history|/proc/(?:self|\d+|\*)/(?:environ|mem|maps|cmdline)|169\.254\.169\.254|metadata\.google\.internal|(?:^|[\s\'"=])/root/')
+_ESCAPE_RX = _RX(r'(?i)docker\.sock|\bnsenter\b|release_agent|/proc/1/|notify_on_release')
+_REVSHELL_RX = _RX(r'(?i)/dev/tcp/|\bbash\s+-i\b|\bsh\s+-i\b|\bnc(?:at)?\s+(?:-\w*[ec]\b|[^\n]{0,40}\s-e\b)|\bsocat\b[^\n]*exec|\bmkfifo\b[^\n]*\bnc\b|0<&\d+|pty\.spawn')
+_PERSIST_RX = _RX(r'(?i)\bcrontab\s+-|/etc/cron|/var/spool/cron|systemctl\s+(?:enable|start|daemon-reload)|/etc/systemd|\.bashrc\b|\.bash_profile\b|\.zshrc\b|rc\.local|authorized_keys|/etc/init\.d|ld\.so\.preload|\bLD_PRELOAD\b')
+_DLEXEC_RX = _RX(r'(?i)\b(?:curl|wget)\b[^|;\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b')
+_CHMODX_RX = _RX(r'(?i)\bchmod\s+(?:-\w+\s+)?(?:\+x|u\+x|a\+x|[0-7]?[0-7][0-7][157])\b')
+_SUSP_NET_RX = _RX(r'(?i)https?://(?!127\.|0\.0\.0\.0|localhost|10\.|192\.168\.)\d{1,3}(?:\.\d{1,3}){3}|\.onion\b|ngrok|serveo\.net|localtunnel|loca\.lt|trycloudflare|pastebin\.com/raw|hastebin|transfer\.sh|anonfiles|file\.io/|webhook\.site|requestbin|pipedream\.net|interact\.sh|burpcollaborator|grabify|iplogger|discord(?:app)?\.com/api/webhooks')
+_HOST_BASE_RX = _RX(r'(?i)bot_data\.db|\bupload_bots\b|demon_hosting')
+# command-context patterns (only trusted when the code also runs shell commands)
+_DESTRUCT_RX = _RX(r'(?i)\brm\s+-[a-z]*r[a-z]*\s+(?:--no-preserve-root\s+)?(?:/|~|\$HOME|\*)(?:\s|\*|$)|\bmkfs(?:\.\w+)?\b|\bdd\s+if=\S+\s+of=/dev/|:\(\)\s*\{\s*:\s*\|\s*:\s*&|\bchmod\s+-R\s+777\b|>\s*/dev/(?:sd|nvme|vd)')
+_POWER_RX = _RX(r'(?i)(?<![\w.])(?:shutdown|poweroff|reboot|halt)(?![\w.])|\binit\s+0\b')
+_KILL_RX = _RX(r'(?i)\b(?:pkill|killall)\b|\bkill\s+-(?:9|KILL)\b')
+_PRIV_RX = _RX(r'(?i)(?<![\w.])sudo\b|\bsu\s+(?:-|root)|\bsetuid\b|\bchown\s+root|\biptables\b|\bip6tables\b|\bufw\s|\buseradd\b|\badduser\b|\busermod\b|\bpasswd\s')
+_DETACH_RX = _RX(r'(?i)\bnohup\b|\bsetsid\b|\bdisown\b|&\s*$')
+
+_SAFE_WRITE_PREFIXES = ('/tmp/', '/var/tmp/', '/dev/null')
+_NET_FETCH = {'requests.get', 'requests.post', 'requests.put', 'requests.patch', 'requests.request', 'requests.head',
+              'requests.delete', 'urllib.request.urlopen', 'urllib.request.urlretrieve', 'urllib.request.Request',
+              'urlopen', 'urlretrieve', 'httpx.get', 'httpx.post', 'httpx.request', 'urllib3.request', 'wget.download',
+              'http.client.HTTPConnection', 'http.client.HTTPSConnection', 'aiohttp.ClientSession'}
+_NET_SEND_METHODS = {'post', 'put', 'patch', 'request', 'send', 'sendall', 'sendto', 'sendmail', 'send_message',
+                     'storbinary', 'storlines'}
+_NET_SEND_FULL = {'requests.post', 'requests.put', 'requests.patch', 'requests.request', 'httpx.post', 'httpx.request',
+                  'urllib.request.urlopen', 'urlopen', 'urllib.request.Request', 'urllib3.request'}
+_DECODE_CALLS = {'base64.b64decode', 'base64.b32decode', 'base64.b16decode', 'base64.a85decode', 'base64.b85decode',
+                 'base64.urlsafe_b64decode', 'base64.decodebytes', 'b64decode', 'binascii.unhexlify', 'binascii.a2b_base64',
+                 'bytes.fromhex', 'zlib.decompress', 'gzip.decompress', 'bz2.decompress', 'lzma.decompress', 'codecs.decode',
+                 'marshal.loads'}
+_SPAWN_FULL = {'os.system', 'os.popen', 'os.posix_spawn', 'os.posix_spawnp', 'pty.spawn', 'commands.getoutput',
+               'asyncio.create_subprocess_exec', 'asyncio.create_subprocess_shell'}
+_LOW_LEVEL_MODULES = {'ctypes', 'paramiko', 'pexpect', 'pty', 'telnetlib', 'fabric', 'scapy', 'pynput', 'keyboard',
+                      'pyautogui', 'pyperclip', 'mss', 'win32api', 'pywinauto', 'cffi'}
+_COVERED_CALLS = {'eval', 'exec', 'compile', '__import__', 'os.system', 'os.popen', 'os.remove', 'os.unlink', 'shutil.rmtree'}
+_ENV_NARROW_ATTRS = {'get', 'setdefault', 'pop', 'update', '__contains__', '__getitem__', '__setitem__', 'clear'}
+_READ_ONLY_HELPERS = {'open', 'Path', 'pathlib.Path', 'io.open', 'codecs.open', 'os.open'}
+
+
+def _shannon_entropy(text):
+    if not text:
+        return 0.0
+    counts = {}
+    for ch in text:
+        counts[ch] = counts.get(ch, 0) + 1
+    total = float(len(text))
+    return -sum((n / total) * math.log(n / total, 2) for n in counts.values())
+
+
+def _line_of(text, pos):
+    return text.count('\n', 0, pos) + 1
+
+
+def _host_markers():
+    """Absolute paths that identify THIS hosting bot's own data (looked up when scanning)."""
+    markers = []
+    for value in (BASE_DIR, UPLOAD_BOTS_DIR, IROTECH_DIR, DATABASE_PATH, os.path.abspath(__file__)):
+        value = str(value or '')
+        if len(value) > 8:
+            markers.append(value)
+    return markers
+
+
+def _string_rule_findings(text, line, in_command_context, findings):
+    """Apply the text patterns to ONE string (or a whole file). Appends (rule, line, detail)."""
+    if not text or len(text) < 3:
+        return
+    low = text.lower()
+    if _MINER_RX.search(text):
+        findings.append(('miner', line, 'mining keyword'))
+    if _REVSHELL_RX.search(text):
+        findings.append(('reverse_shell', line, 'reverse shell text'))
+    if _ESCAPE_RX.search(text):
+        findings.append(('container_escape', line, 'container / process access'))
+    if _SECRET_FILE_RX.search(text):
+        findings.append(('secret_files', line, _SECRET_FILE_RX.search(text).group(0).strip(' \'"=')[:40]))
+    if _PERSIST_RX.search(text):
+        findings.append(('persistence', line, _PERSIST_RX.search(text).group(0)[:40]))
+    if _DLEXEC_RX.search(text):
+        findings.append(('download_exec', line, 'pipe download into shell'))
+    if _SUSP_NET_RX.search(text):
+        findings.append(('suspicious_net', line, _SUSP_NET_RX.search(text).group(0)[:50]))
+    if _HOST_BASE_RX.search(text) or any(marker in text for marker in _host_markers()):
+        findings.append(('host_files', line, 'hosting folder / database'))
+    if '.env' in low and ('upload_bots' in low or '../' in low or '*' in text):
+        findings.append(('other_bots_env', line, '.env of other folders'))
+    if in_command_context:
+        if _DESTRUCT_RX.search(text):
+            findings.append(('destructive', line, _DESTRUCT_RX.search(text).group(0)[:40]))
+        if _POWER_RX.search(text):
+            findings.append(('host_power', line, 'shutdown / reboot'))
+        if _KILL_RX.search(text):
+            findings.append(('kill_procs', line, 'pkill / killall'))
+        if _PRIV_RX.search(text):
+            findings.append(('priv_esc', line, 'sudo / security tools'))
+        if _DETACH_RX.search(text):
+            findings.append(('detach', line, 'nohup / setsid / background'))
+        if _CHMODX_RX.search(text):
+            findings.append(('chmod_exec', line, 'chmod +x'))
+
+
+class _PyDetector:
+    """Walks a Python syntax tree and reports findings. Never executes anything."""
+
+    def __init__(self, tree, source, depth=0):
+        self.tree, self.source, self.depth = tree, source, depth
+        self.findings = []
+        self.aliases = {}
+        self.parent = {}
+        self.var_tags = {}
+        self.caps = set()
+        self.str_env = {}
+        self.strings = []   # (line, text)
+        self.nodes = list(ast.walk(tree))
+        for node in self.nodes:
+            for child in ast.iter_child_nodes(node):
+                self.parent[child] = node
+
+    # ---- name / string helpers
+    def _collect_aliases(self):
+        for node in self.nodes:
+            if isinstance(node, ast.Import):
+                for item in node.names:
+                    self.aliases[item.asname or item.name.split('.')[0]] = item.name if item.asname else item.name.split('.')[0]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                for item in node.names:
+                    self.aliases[item.asname or item.name] = f'{node.module}.{item.name}'
+
+    def dotted(self, node):
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(self.aliases.get(node.id, node.id))
+        elif isinstance(node, ast.Call):
+            inner = self.dotted(node.func)
+            if inner:
+                parts.append(inner)
+            else:
+                return ''
+        else:
+            return ''
+        return '.'.join(reversed(parts))
+
+    def fold(self, node, depth=0):
+        """Best-effort constant string for an expression (None if it is not constant)."""
+        if depth > 6 or node is None:
+            return None
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                return node.value
+            if isinstance(node.value, bytes):
+                return node.value.decode('utf-8', 'ignore')
+            return None
+        if isinstance(node, ast.Name):
+            return self.str_env.get(node.id)
+        if isinstance(node, ast.JoinedStr):
+            out = []
+            for part in node.values:
+                if isinstance(part, ast.Constant):
+                    out.append(str(part.value))
+                else:
+                    out.append('{}')
+            return ''.join(out)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+            left, right = self.fold(node.left, depth + 1), self.fold(node.right, depth + 1)
+            if left is not None and right is not None:
+                return left + right
+            if left is not None and isinstance(node.op, ast.Mod):
+                return left
+            return None
+        if isinstance(node, ast.Call):
+            name = self.dotted(node.func)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == 'join' and node.args:
+                sep = self.fold(node.func.value, depth + 1)
+                seq = node.args[0]
+                if sep is not None and isinstance(seq, (ast.List, ast.Tuple)):
+                    items = [self.fold(item, depth + 1) for item in seq.elts]
+                    if all(item is not None for item in items):
+                        return sep.join(items)
+                return None
+            if name == 'chr' and len(node.args) == 1 and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, int):
+                try:
+                    return chr(node.args[0].value)
+                except (ValueError, OverflowError):
+                    return None
+            decoded = self._decode_constant(node, name, depth)
+            if decoded is not None:
+                return decoded
+            if isinstance(node.func, ast.Attribute) and node.func.attr in ('decode', 'strip', 'lower', 'upper', 'format'):
+                return self.fold(node.func.value, depth + 1)
+        return None
+
+    def _decode_constant(self, node, name, depth):
+        """Decode base64 / hex / zlib / rot13 payloads that are written as constants."""
+        if not node.args:
+            return None
+        leaf = name.rsplit('.', 1)[-1]
+        if leaf not in ('b64decode', 'urlsafe_b64decode', 'b32decode', 'b16decode', 'a85decode', 'b85decode', 'decodebytes',
+                        'unhexlify', 'a2b_base64', 'fromhex', 'decompress', 'decode'):
+            return None
+        inner = node.args[0]
+        raw = self._raw_bytes(inner, depth + 1)
+        if raw is None:
+            return None
+        try:
+            if leaf in ('b64decode', 'urlsafe_b64decode', 'decodebytes', 'a2b_base64'):
+                data = base64.b64decode(raw + b'=' * (-len(raw) % 4), validate=False)
+            elif leaf == 'b32decode':
+                data = base64.b32decode(raw)
+            elif leaf == 'b16decode':
+                data = base64.b16decode(raw)
+            elif leaf == 'a85decode':
+                data = base64.a85decode(raw)
+            elif leaf == 'b85decode':
+                data = base64.b85decode(raw)
+            elif leaf in ('unhexlify', 'fromhex'):
+                data = bytes.fromhex(raw.decode('ascii', 'ignore'))
+            elif leaf == 'decompress':
+                data = zlib.decompress(raw)
+            else:
+                return None
+            return data[:200000].decode('utf-8', 'ignore')
+        except Exception:
+            return None
+
+    def _raw_bytes(self, node, depth):
+        if depth > 6:
+            return None
+        text = self.fold(node, depth)
+        if text is not None:
+            return text.encode('utf-8', 'ignore')
+        if isinstance(node, ast.Call):
+            name = self.dotted(node.func)
+            leaf = name.rsplit('.', 1)[-1]
+            if leaf in ('b64decode', 'decompress', 'unhexlify', 'fromhex') and node.args:
+                inner = self._decode_constant(node, name, depth + 1)
+                if inner is not None:
+                    return inner.encode('utf-8', 'ignore')
+            if isinstance(node.func, ast.Attribute) and node.func.attr in ('encode',):
+                return self._raw_bytes(node.func.value, depth + 1)
+        return None
+
+    # ---- environment access
+    def _is_environ(self, node):
+        return self.dotted(node) in ('os.environ', 'os.environb')
+
+    def _environ_is_broad(self, node):
+        parent = self.parent.get(node)
+        if isinstance(parent, ast.Subscript) and parent.value is node:
+            return False   # os.environ['KEY'] reads one setting
+        if isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in _ENV_NARROW_ATTRS:
+            return False
+        if isinstance(parent, ast.Compare) and node in parent.comparators and any(isinstance(op, (ast.In, ast.NotIn)) for op in parent.ops):
+            return False
+        if isinstance(parent, ast.keyword) and parent.arg == 'env':
+            return False
+        return True
+
+    # ---- tags: what kind of data flows into an expression (simple, flow-insensitive)
+    def tags(self, node):
+        found = set()
+        if node is None:
+            return found
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name):
+                found |= self.var_tags.get(sub.id, set())
+            elif isinstance(sub, ast.Call):
+                name = self.dotted(sub.func)
+                if name in _NET_FETCH or (name.endswith(('.get', '.post')) and name.split('.')[0] in ('requests', 'httpx', 'session', 'aiohttp')):
+                    found.add('net')
+                if name in _DECODE_CALLS or name.rsplit('.', 1)[-1] in ('b64decode', 'unhexlify'):
+                    found.add('decode')
+                if name in _READ_ONLY_HELPERS and sub.args:
+                    text = self.fold(sub.args[0]) or ''
+                    if text and (_SECRET_FILE_RX.search(text) or _HOST_BASE_RX.search(text) or any(m in text for m in _host_markers())):
+                        found.add('secret')
+            elif isinstance(sub, (ast.Attribute, ast.Subscript, ast.Name)):
+                target = sub.value if isinstance(sub, ast.Subscript) else sub
+                if isinstance(target, (ast.Attribute, ast.Name)) and self._is_environ(target) and self._environ_is_broad(target):
+                    found.add('env')
+        return found
+
+    def _compute_var_tags(self):
+        for node in self.nodes:
+            if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Constant, ast.JoinedStr, ast.BinOp)):
+                text = self.fold(node.value)
+                if text is not None:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            self.str_env[target.id] = text
+        for _ in range(3):
+            for node in self.nodes:
+                pairs = []
+                if isinstance(node, ast.Assign):
+                    pairs = [(t, node.value) for t in node.targets]
+                elif isinstance(node, (ast.AugAssign, ast.AnnAssign)) and getattr(node, 'value', None) is not None:
+                    pairs = [(node.target, node.value)]
+                elif isinstance(node, ast.NamedExpr):
+                    pairs = [(node.target, node.value)]
+                elif isinstance(node, (ast.For, ast.AsyncFor)):
+                    pairs = [(node.target, node.iter)]
+                elif isinstance(node, (ast.With, ast.AsyncWith)):
+                    pairs = [(item.optional_vars, item.context_expr) for item in node.items if item.optional_vars is not None]
+                for target, value in pairs:
+                    value_tags = self.tags(value)
+                    if not value_tags:
+                        continue
+                    for sub in ast.walk(target):
+                        if isinstance(sub, ast.Name):
+                            self.var_tags.setdefault(sub.id, set()).update(value_tags)
+
+    # ---- the detection pass
+    def run(self):
+        self._collect_aliases()
+        self._compute_var_tags()
+        docstrings = set()
+        for node in self.nodes:
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body:
+                first = node.body[0]
+                if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                    docstrings.add(id(first.value))
+        imported = set(self.aliases.values()) | {value.split('.')[0] for value in self.aliases.values()}
+        for module in sorted(_LOW_LEVEL_MODULES & imported):
+            self.findings.append(('low_level', 1, f'imports {module}'))
+        for node in self.nodes:
+            line = getattr(node, 'lineno', 0)
+            if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and id(node) not in docstrings:
+                text = node.value if isinstance(node.value, str) else node.value.decode('utf-8', 'ignore')
+                self.strings.append((line, text))
+                if len(text) >= 200 and ' ' not in text.strip() and _shannon_entropy(text) > 4.6:
+                    self.findings.append(('obfuscated', line, 'long encoded string'))
+            elif isinstance(node, (ast.JoinedStr, ast.BinOp)) or (isinstance(node, ast.Call) and (
+                    (isinstance(node.func, ast.Attribute) and node.func.attr in ('join', 'decode', 'format'))
+                    or self.dotted(node.func).rsplit('.', 1)[-1] in ('b64decode', 'unhexlify', 'fromhex', 'decompress', 'a85decode', 'b85decode'))):
+                text = self.fold(node)
+                if text and len(text) >= 3:
+                    self.strings.append((line, text))
+            if isinstance(node, (ast.Attribute, ast.Name)) and self._is_environ(node) and self._environ_is_broad(node):
+                self.findings.append(('env_broad', line, 'os.environ read as a whole'))
+                self.caps.add('env_broad')
+            if isinstance(node, ast.Name) and node.id in ('__builtins__',) or (isinstance(node, ast.Attribute) and node.attr in ('__builtins__', '__globals__', '__subclasses__', '__bases__')):
+                self.findings.append(('dyn_access', line, 'builtins / globals access'))
+            if isinstance(node, ast.Call):
+                self._call(node, line)
+        # string-based rules
+        command_ctx = bool({'cmd'} & self.caps)
+        seen = set()
+        for line, text in self.strings:
+            key = (line, text[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            _string_rule_findings(text, line, command_ctx, self.findings)
+            if len(text) >= 40 and self.depth < 2 and (text.lstrip().startswith(('import ', 'from ', 'def ', 'exec', 'eval', '__import__', 'os.', 'subprocess')) or '\n' in text):
+                inner = _scan_python_text(text, self.depth + 1)
+                if inner:
+                    self.findings.extend((rid, line, 'hidden code: ' + detail) for rid, _l, detail in inner)
+        # traversal
+        for line, text in self.strings:
+            if '../' in text.replace('\\', '/') and len(text) < 300:
+                self.findings.append(('path_traversal', line, 'uses ../'))
+                break
+        # combos that need the whole-file view
+        if 'selfsrc' in self.caps and 'write' in self.caps and ('walk' in self.caps or any(f[0] == 'host_files' for f in self.findings)):
+            self.findings.append(('self_replicate', 1, 'reads its own file and writes copies'))
+        if 'net_write' in self.caps and 'chmod_exec' in self.caps and 'cmd' in self.caps:
+            self.findings.append(('download_exec', 1, 'downloads, makes executable, runs'))
+        if 'walk' in self.caps and any(re.search(r'^\.env$|/\.env$|\*\.env', text) for _l, text in self.strings):
+            self.findings.append(('other_bots_env', 1, 'walks folders looking for .env'))
+        if 'process_iter' in self.caps and 'kill' in self.caps:
+            self.findings.append(('kill_procs', 1, 'walks all processes and kills them'))
+        return self.findings
+
+    def _call(self, node, line):
+        name = self.dotted(node.func)
+        leaf = name.rsplit('.', 1)[-1]
+        args_tags = set()
+        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+            args_tags |= self.tags(arg)
+        first = node.args[0] if node.args else None
+        first_const = self.fold(first) if first is not None else None
+
+        if name in ('eval', 'exec', 'compile', '__import__', 'builtins.eval', 'builtins.exec', 'builtins.compile'):
+            if args_tags & {'net', 'decode'}:
+                self.findings.append(('remote_code', line, f'{leaf}() on downloaded / decoded data'))
+            elif first is not None and first_const is None:
+                self.findings.append(('dyn_exec', line, f'{leaf}() with a runtime value'))
+                if any(isinstance(sub, ast.Call) and self.dotted(sub.func) in ('chr', 'bytes', 'bytearray') for sub in ast.walk(first)):
+                    self.findings.append(('evasion', line, 'code assembled from character codes'))
+        if name == 'getattr' and node.args and self.dotted(node.args[0]) in ('os', 'subprocess', 'builtins', 'sys', 'ctypes', 'importlib'):
+            self.findings.append(('dyn_access', line, 'getattr on a system module'))
+            hidden = self.fold(node.args[1]) if len(node.args) > 1 else None
+            if hidden and not isinstance(node.args[1], ast.Constant) and re.search(r'system|popen|exec|spawn|Popen|eval|compile|import', hidden):
+                self.findings.append(('evasion', line, f'builds the name "{hidden[:20]}"'))
+        if name in ('importlib.import_module',) and first is not None and first_const is None:
+            self.findings.append(('dyn_exec', line, 'import of a runtime-chosen module'))
+        if name in ('marshal.loads', 'marshal.load'):
+            self.findings.append(('marshal', line, 'marshal'))
+        if name == 'os.system' or name == 'os.popen' or name.startswith(('os.exec', 'os.spawn')) or name in _SPAWN_FULL:
+            self.findings.append(('os_command', line, name))
+            self.caps.add('cmd')
+        if name.startswith('subprocess.') or name in ('Popen', 'check_output', 'check_call') and self.aliases.get(leaf, '').startswith('subprocess'):
+            self.findings.append(('subprocess', line, name))
+            self.caps.add('cmd')
+            for kw in node.keywords:
+                if kw.arg in ('start_new_session', 'preexec_fn', 'creationflags'):
+                    self.findings.append(('detach', line, f'{kw.arg} in subprocess'))
+        if name in ('os.fork', 'os.setsid', 'os.setpgrp', 'os.daemon', 'os.forkpty', 'daemon.DaemonContext'):
+            self.findings.append(('detach', line, name))
+        if name in ('os.setuid', 'os.seteuid', 'os.setgid', 'os.chroot', 'os.setresuid'):
+            self.findings.append(('priv_esc', line, name))
+        if name == 'shutil.rmtree':
+            self.findings.append(('rm_tree', line, name))
+        if name in ('os.remove', 'os.unlink', 'os.rmdir', 'os.removedirs'):
+            self.findings.append(('file_delete', line, name))
+        if name in ('socket.socket', 'socket.create_connection', 'socket.fromfd', 'ssl.wrap_socket') or name.startswith('socketserver.'):
+            self.findings.append(('raw_socket', line, name))
+            self.caps.add('socket')
+        if name in ('os.dup2',) and 'socket' in self.caps:
+            self.findings.append(('reverse_shell', line, 'socket redirected into a shell'))
+        if leaf in ('bind', 'listen') and 'socket' in self.caps:
+            self.findings.append(('open_port', line, 'listens on a port'))
+        if name in ('os.walk', 'glob.glob', 'glob.iglob', 'os.scandir') or leaf in ('rglob', 'iterdir'):
+            self.caps.add('walk')
+        if name in ('psutil.process_iter',):
+            self.caps.add('process_iter')
+        if leaf in ('kill', 'terminate') and name != 'os.kill':
+            self.caps.add('kill')
+        if name in ('os.chmod', 'os.fchmod'):
+            mode = node.args[1] if len(node.args) > 1 else None
+            if isinstance(mode, ast.Constant) and isinstance(mode.value, int) and mode.value & 0o111:
+                self.findings.append(('chmod_exec', line, 'chmod with execute bit'))
+                self.caps.add('chmod_exec')
+            elif mode is not None and not isinstance(mode, ast.Constant):
+                self.findings.append(('chmod_exec', line, 'chmod with a computed mode'))
+                self.caps.add('chmod_exec')
+        # file writes outside the user's folder
+        write_target = None
+        if name in ('open', 'io.open', 'codecs.open') and first is not None:
+            mode_node = node.args[1] if len(node.args) > 1 else next((kw.value for kw in node.keywords if kw.arg == 'mode'), None)
+            mode_text = self.fold(mode_node) or ''
+            if any(flag in mode_text for flag in 'wax+'):
+                write_target = first_const
+                self.caps.add('write')
+        if name in ('shutil.copy', 'shutil.copy2', 'shutil.copyfile', 'shutil.copytree', 'shutil.move', 'os.rename', 'os.replace',
+                    'os.symlink', 'os.link') and len(node.args) > 1:
+            write_target = self.fold(node.args[1])
+            self.caps.add('write')
+        if name in ('os.makedirs', 'os.mkdir', 'os.chown', 'os.truncate') and first_const:
+            write_target = first_const
+        if leaf in ('write_text', 'write_bytes', 'touch', 'mkdir') and isinstance(node.func, ast.Attribute):
+            self.caps.add('write')
+            base = node.func.value
+            if isinstance(base, ast.Call) and self.dotted(base.func) in ('Path', 'pathlib.Path') and base.args:
+                write_target = self.fold(base.args[0])
+        if write_target is not None:
+            norm = write_target.replace('\\', '/')
+            if (norm.startswith('/') and not norm.startswith(_SAFE_WRITE_PREFIXES)) or norm.startswith('~') or '../' in norm:
+                self.findings.append(('write_outside', line, norm[:60]))
+        if leaf in ('write', 'write_bytes', 'write_text', 'copyfileobj') and 'net' in args_tags:
+            self.caps.add('net_write')
+        # self-replication source
+        for arg in node.args[:1]:
+            if isinstance(arg, ast.Name) and arg.id == '__file__' or (isinstance(arg, ast.Subscript) and self.dotted(arg.value) == 'sys.argv'):
+                if name in ('open', 'shutil.copy', 'shutil.copy2', 'shutil.copyfile', 'Path', 'pathlib.Path') or leaf in ('read_text', 'read_bytes'):
+                    self.caps.add('selfsrc')
+        if name == 'inspect.getsource' or name == 'inspect.getsourcefile':
+            self.caps.add('selfsrc')
+        # exfiltration: secrets going into a network send
+        sends = name in _NET_SEND_FULL or (leaf in _NET_SEND_METHODS and leaf not in ('send_message',) and name.split('.')[0] in ('requests', 'httpx', 'session', 'socket', 'sock', 's', 'conn', 'smtplib', 'ftplib', 'client'))
+        if name in ('smtplib.SMTP', ) or leaf in ('sendmail', 'storbinary'):
+            sends = True
+        if sends and args_tags & {'env', 'secret'}:
+            self.findings.append(('steal_exfil', line, f'{leaf}() sends secrets'))
+        if name in ('requests.get', 'httpx.get', 'urllib.request.urlopen', 'urlopen') and args_tags & {'env', 'secret'}:
+            self.findings.append(('steal_exfil', line, 'secrets placed in a web address'))
+        # blocked list from SECURITY_CONFIG (generic, so editing the config extends the scanner)
+        for entry in _security_config_entries():
+            if name == entry or name.startswith(entry + '.'):
+                if name not in _COVERED_CALLS and not name.startswith('subprocess'):
+                    self.findings.append(('blocked_cfg', line, name))
+
+
+def _security_config_entries():
+    """Dotted names from SECURITY_CONFIG. Bare 'os' / 'zipfile' are ignored: nearly every bot imports them."""
+    entries = []
+    for key in ('blocked_modules', 'blocked_imports'):
+        for entry in SECURITY_CONFIG.get(key, []):
+            if '.' in entry and entry not in entries:
+                entries.append(entry)
+    return entries
+
+
+def _scan_python_text(source, depth=0):
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    try:
+        return _PyDetector(tree, source, depth).run()
+    except RecursionError:
+        return [('obfuscated', 1, 'code is nested too deeply to analyse')]
+
+
+_JS_RULES = [
+    ('subprocess', _RX(r'''(?:require\(\s*['"](?:node:)?child_process['"]\s*\)|from\s+['"](?:node:)?child_process['"])'''), 'child_process'),
+    ('dyn_exec', _RX(r'\beval\s*\(|\bnew\s+Function\s*\(|\bvm\.(?:runIn\w*|Script)\b|\brequire\(\s*[\'"]vm[\'"]\s*\)'), 'eval / Function / vm'),
+    ('raw_socket', _RX(r'''require\(\s*['"](?:node:)?(?:net|dgram|tls)['"]\s*\)|from\s+['"](?:node:)?(?:net|dgram|tls)['"]'''), 'net / dgram / tls'),
+    ('detach', _RX(r'detached\s*:\s*true|\.unref\s*\('), 'detached process'),
+    ('low_level', _RX(r'''require\(\s*['"](?:ffi-napi|node-ffi|ref-napi|ssh2|node-pty|robotjs|iohook|keylogger)['"]|process\.(?:binding|dlopen)\b'''), 'native / remote tools'),
+    ('write_outside', _RX(r'''fs(?:\.promises)?\.(?:write|append|create|copy|rename|mkdir|chmod|symlink)\w*\(\s*[`'"](?:/(?!tmp/)|\.\./|~)'''), 'fs write outside'),
+    ('rm_tree', _RX(r'\bfs\.(?:rmSync|rmdirSync|rm|rmdir)\s*\([^)]*recursive'), 'recursive delete'),
+    ('obfuscated', _RX(r'eval\(function\(p,a,c,k,e|(?:_0x[0-9a-f]{3,}[^\n]{0,80}){6}'), 'packed / obfuscated'),
+    ('marshal', _RX(r'process\.mainModule\.require'), 'hidden require'),
+]
+_JS_ENV_DUMP = _RX(r'Object\.(?:keys|entries|values|assign)\s*\(\s*process\.env|JSON\.stringify\s*\(\s*process\.env|\.\.\.\s*process\.env|\bprocess\.env\s*[,)]')
+_JS_NET_SEND = _RX(r'axios\.(?:post|put|patch)|\bfetch\s*\(|https?\.request|XMLHttpRequest|webhook|\.post\s*\(')
+_JS_REMOTE = _RX(r'''atob\(|Buffer\.from\([^)]*['"]base64['"]|\bfetch\(|https?\.get\(|axios\.get\(''')
+_JS_SELFCOPY = _RX(r'(?:readFileSync|copyFileSync|copyFile)\s*\(\s*(?:__filename|process\.argv\[1\])')
+
+
+def _js_detect(text):
+    findings = []
+    for rule_id, rx, detail in _JS_RULES:
+        for match in rx.finditer(text):
+            line = _line_of(text, match.start())
+            if rule_id == 'dyn_exec':
+                window = text[max(0, match.start() - 400):match.end() + 400]
+                if _JS_REMOTE.search(window):
+                    findings.append(('remote_code', line, 'eval on downloaded / decoded data'))
+                    continue
+            findings.append((rule_id, line, detail))
+            break
+    for match in _JS_ENV_DUMP.finditer(text):
+        line = _line_of(text, match.start())
+        findings.append(('env_broad', line, 'process.env as a whole'))
+        if _JS_NET_SEND.search(text[max(0, match.start() - 500):match.end() + 500]):
+            findings.append(('steal_exfil', line, 'environment sent over the network'))
+        break
+    for match in re.finditer(r'process\.env\b(?!\s*[.\[])', text):
+        before = text[max(0, match.start() - 8):match.start()].rstrip()
+        if before.endswith('} ='):
+            continue
+        if re.match(r'\s*[;)\n]', text[match.end():match.end() + 3]) and re.search(r'(?:=|\()\s*$', before):
+            findings.append(('env_broad', _line_of(text, match.start()), 'process.env as a whole'))
+            break
+    if _JS_SELFCOPY.search(text) and re.search(r'writeFile\w*\(|copyFile\w*\(', text) and re.search(r'readdir|walk|glob', text):
+        findings.append(('self_replicate', 1, 'copies its own file'))
+    if re.search(r'child_process', text):
+        for rx, rid in ((_DESTRUCT_RX, 'destructive'), (_POWER_RX, 'host_power'), (_KILL_RX, 'kill_procs'), (_PRIV_RX, 'priv_esc')):
+            match = rx.search(text)
+            if match:
+                findings.append((rid, _line_of(text, match.start()), match.group(0)[:40]))
+    _string_rule_findings(text, 1, False, findings)
+    return findings
+
+
+def _text_obfuscation_findings(text):
+    """Whole-file heuristics: long unreadable lines, escape floods, scrambled names."""
+    findings = []
+    lines = text.split('\n')
+    long_lines = [index for index, value in enumerate(lines, 1) if len(value) > 2000]
+    if long_lines:
+        findings.append(('obfuscated', long_lines[0], 'extremely long line'))
+    elif len(text) > 400000 and lines and len(text) / max(1, len(lines)) > 600:
+        findings.append(('obfuscated', 1, 'dense unreadable code'))
+    if len(re.findall(r'\\x[0-9a-fA-F]{2}', text)) > 300 or len(re.findall(r'_0x[0-9a-f]{4,}', text)) > 40:
+        findings.append(('obfuscated', 1, 'escape-code flood'))
+    if len(re.findall(r'\bchr\(\s*\d+\s*\)', text)) > 60:
+        findings.append(('obfuscated', 1, 'text built from character codes'))
+    return findings
+
+
+def score_findings(findings):
+    """PURE scoring: findings [(rule_id, line, detail)] -> {'level','score','reasons'}.
+    Each rule adds its points per distinct hit (capped); the level is the higher of the
+    score thresholds and any rule floor. Nothing else decides the verdict."""
+    by_rule = {}
+    for rule_id, line, detail in findings:
+        if rule_id not in SCAN_RULES:
+            continue
+        entry = by_rule.setdefault(rule_id, {'lines': [], 'details': []})
+        if line not in entry['lines']:
+            entry['lines'].append(line)
+        if detail and detail not in entry['details']:
+            entry['details'].append(detail)
+    total = 0
+    floor = THREAT_LOW
+    reasons = []
+    for rule_id, entry in by_rule.items():
+        points, rule_floor, cap, text = SCAN_RULES[rule_id]
+        earned = min(cap, points * max(1, len(entry['lines'])))
+        total += earned
+        if rule_floor and THREAT_RANK[rule_floor] > THREAT_RANK[floor]:
+            floor = rule_floor
+        reasons.append({'id': rule_id, 'text': text, 'points': earned, 'floor': rule_floor or THREAT_LOW,
+                        'lines': sorted(x for x in entry['lines'] if x)[:4], 'details': entry['details'][:3]})
+    level = THREAT_LOW
+    if total >= SCAN_HIGH_SCORE:
+        level = THREAT_HIGH
+    elif total >= SCAN_MEDIUM_SCORE:
+        level = THREAT_MEDIUM
+    if THREAT_RANK[floor] > THREAT_RANK[level]:
+        level = floor
+    reasons.sort(key=lambda item: (-THREAT_RANK[item['floor']], -item['points']))
+    return {'level': level, 'score': total, 'reasons': reasons}
+
+
+def scan_source(content, file_type, filename=''):
+    """Scan one source file's TEXT. file_type is 'py' or 'js'. Returns the scan result dict."""
+    findings = []
+    try:
+        if file_type == 'py':
+            py_findings = _scan_python_text(content)
+            if py_findings is None:
+                # Broken Python is still scanned as plain text so a typo cannot hide a payload.
+                py_findings = []
+                _string_rule_findings(content, 1, True, py_findings)
+                for rx, rid, label in ((_RX(r'\bos\.(?:system|popen)\s*\('), 'os_command', 'os.system'),
+                                       (_RX(r'\bsubprocess\.\w+\s*\('), 'subprocess', 'subprocess'),
+                                       (_RX(r'\b(?:eval|exec)\s*\('), 'dyn_exec', 'eval / exec'),
+                                       (_RX(r'\bsocket\.socket\s*\('), 'raw_socket', 'socket')):
+                    match = rx.search(content)
+                    if match:
+                        py_findings.append((rid, _line_of(content, match.start()), label))
+            findings.extend(py_findings)
+        else:
+            findings.extend(_js_detect(content))
+        findings.extend(_text_obfuscation_findings(content))
+    except Exception as exc:   # a scanner failure must never mean "safe"
+        logger.warning('Scanner could not fully analyse %s: %s', filename, exc)
+        findings.append(('unreadable', 1, 'scanner error'))
+    result = score_findings(findings)
+    result.update({'file': filename, 'type': file_type, 'size': len(content), 'scanner': SCANNER_VERSION})
+    return result
+
+
+def scan_bytes(data, file_type, filename=''):
+    """Scan raw uploaded bytes (what we receive from Telegram). Binary content is MEDIUM."""
+    digest = hashlib.sha256(data).hexdigest()
+    if len(data) > SCAN_MAX_SOURCE_BYTES:
+        result = score_findings([('too_big', 1, f'{len(data) // 1024} KB')])
+    elif b'\x00' in data[:8192]:
+        result = score_findings([('binary', 1, 'contains NUL bytes')])
+    else:
+        try:
+            text = data.decode('utf-8')
+        except UnicodeDecodeError:
+            bad = len(data.decode('utf-8', 'ignore')) / max(1, len(data))
+            text = data.decode('utf-8', 'ignore')
+            if bad < 0.8:
+                result = score_findings([('binary', 1, 'not valid text')])
+                result.update({'file': filename, 'type': file_type, 'size': len(data), 'scanner': SCANNER_VERSION, 'sha256': digest})
+                return result
+        result = scan_source(text, file_type, filename)
+    result.update({'file': filename, 'type': file_type, 'size': len(data), 'scanner': SCANNER_VERSION, 'sha256': digest})
+    return result
+
+
+def scan_requirements_text(text, filename='requirements.txt'):
+    findings = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split('#', 1)[0].strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith(('git+', '-e', '--index-url', '--extra-index-url', '-i ', '--find-links', '-f ', '--trusted-host', '--no-index')) \
+                or '://' in low or low.startswith(('-r ../', '-c ../', '--requirement ..', '/')) or ' @ ' in low:
+            findings.append(('install_risk', number, line[:50]))
+    return findings
+
+
+def scan_package_json_text(text):
+    findings = []
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return [('install_risk', 1, 'package.json is not valid')]
+    scripts = data.get('scripts') or {}
+    for hook in ('preinstall', 'install', 'postinstall', 'prepare', 'prepublish'):
+        if hook in scripts:
+            findings.append(('install_risk', 1, f'{hook} script'))
+    for section in ('dependencies', 'devDependencies', 'optionalDependencies'):
+        for pkg, spec in (data.get(section) or {}).items():
+            spec = str(spec).lower()
+            if spec.startswith(('git', 'http', 'file:', 'github:', 'link:')) or '://' in spec:
+                findings.append(('install_risk', 1, f'{pkg} from {spec[:30]}'))
+    return findings
+
+
+_COMPILED_EXTS = ('.so', '.pyd', '.dll', '.dylib', '.exe', '.node', '.bin', '.elf', '.pyc', '.pyo', '.jar', '.apk', '.msi', '.com', '.scr')
+_VENDOR_DIRS = ('node_modules/', 'site-packages/', 'venv/', '.venv/', 'env/lib/', '__pycache__/')
+
+
+def scan_zip_file(zip_path):
+    """Scan every member of a ZIP without extracting it to disk. Returns a combined result."""
+    members = []   # (name, result)
+    extra = []
+    bundled = compiled = shell = False
+    read_total = 0
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as archive:
+            for item in archive.infolist():
+                if item.is_dir():
+                    continue
+                name = item.filename.replace('\\', '/')
+                low = name.lower()
+                if any(('/' + low).find('/' + vendor) != -1 for vendor in _VENDOR_DIRS):
+                    bundled = True
+                    continue
+                if low.endswith(_COMPILED_EXTS):
+                    compiled = True
+                    continue
+                if low.endswith(('.sh', '.bash')):
+                    shell = True
+                ext = os.path.splitext(low)[1]
+                base = os.path.basename(low)
+                if ext not in ('.py', '.js') and base not in ('requirements.txt', 'package.json') and ext not in ('.sh', '.bash'):
+                    continue
+                if item.file_size > SCAN_MAX_SOURCE_BYTES:
+                    members.append((name, score_findings([('too_big', 1, f'{item.file_size // 1024} KB')])))
+                    continue
+                read_total += item.file_size
+                if read_total > SCAN_MAX_ZIP_READ_BYTES:
+                    extra.append(('too_big', 1, 'archive source is very large'))
+                    break
+                data = archive.read(item)
+                if base == 'requirements.txt':
+                    members.append((name, score_findings(scan_requirements_text(data.decode('utf-8', 'ignore'), name))))
+                elif base == 'package.json':
+                    members.append((name, score_findings(scan_package_json_text(data.decode('utf-8', 'ignore')))))
+                elif ext in ('.sh', '.bash'):
+                    shell_findings = []
+                    _string_rule_findings(data.decode('utf-8', 'ignore'), 1, True, shell_findings)
+                    members.append((name, score_findings(shell_findings)))
+                else:
+                    members.append((name, scan_bytes(data, 'py' if ext == '.py' else 'js', name)))
+    except (zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError) as exc:
+        logger.warning('Could not read archive for scanning: %s', exc)
+        return {'level': THREAT_MEDIUM, 'score': SCAN_MEDIUM_SCORE, 'file': os.path.basename(zip_path), 'type': 'zip',
+                'scanner': SCANNER_VERSION, 'reasons': [{'id': 'unreadable', 'text': SCAN_RULES['unreadable'][3], 'points': 30,
+                                                          'floor': THREAT_MEDIUM, 'lines': [], 'details': []}]}
+    if bundled:
+        extra.append(('bundled_libs', 1, 'vendored folders'))
+    if compiled:
+        extra.append(('compiled_file', 1, 'compiled files'))
+    if shell:
+        extra.append(('shell_script', 1, '.sh'))
+    worst = score_findings(extra)
+    reasons = list(worst['reasons'])
+    level, score = worst['level'], worst['score']
+    for name, result in members:
+        if THREAT_RANK[result['level']] > THREAT_RANK[level]:
+            level = result['level']
+        score = max(score, result['score'])
+        for reason in result['reasons']:
+            tagged = dict(reason)
+            tagged['text'] = f"{reason['text']} [in {name}]"
+            reasons.append(tagged)
+    reasons.sort(key=lambda item: (-THREAT_RANK[item['floor']], -item['points']))
+    return {'level': level, 'score': score, 'reasons': reasons, 'file': os.path.basename(zip_path), 'type': 'zip',
+            'scanner': SCANNER_VERSION, 'files_scanned': len(members)}
+
+
+def scan_summary_text(result, max_reasons=5):
+    """Plain-language bullet lines for people (uploader and admins)."""
+    lines = []
+    for reason in result.get('reasons', [])[:max_reasons]:
+        where = f" (line {reason['lines'][0]})" if reason.get('lines') else ''
+        lines.append(f"• {reason['text']}{where}")
+    extra = len(result.get('reasons', [])) - max_reasons
+    if extra > 0:
+        lines.append(f'• ...and {extra} more')
+    return '\n'.join(lines)
+
+
+def scan_headline(result):
+    level = result.get('level', THREAT_LOW)
+    return f"{THREAT_BADGE[level]} Threat level: {THREAT_NAME[level]} (score {result.get('score', 0)})"
+
+
+# --- Upload review queue, scan records, launch gate and Security Center ---------------------
+# Everything in this section is static: it stores verdicts, moves bytes around and shows buttons.
+# Nothing here ever executes an uploaded file. Execution only happens through run_script /
+# run_js_script, and only after a LOW verdict or an explicit admin approval.
+QUARANTINE_DIR = os.path.join(IROTECH_DIR, 'quarantine')   # held MEDIUM uploads, named <token>.bin, never executed
+REVIEW_LOCK = threading.RLock()     # never take DB_LOCK while holding this lock
+PENDING_REVIEWS = {}                # token -> entry dict (see _submit_for_review)
+REVIEW_TTL = 3 * 24 * 3600          # an unanswered review expires after 3 days
+REVIEW_MAX_TOTAL = 30               # most uploads that may wait for review at the same time
+REVIEW_MAX_PER_USER = 3             # most uploads one user may have waiting
+RECENT_SCANS = deque(maxlen=15)     # in-memory activity feed for the Security Center
+_TOKEN_RE = re.compile(r'[0-9a-f]{8}')
+RESCAN_ALL_CAP = 500
+
+
+class _ChatRef:
+    def __init__(self, ident):
+        self.id = ident
+
+
+class _ReplyTarget:
+    """Stand-in for a Telegram message when feedback must go to someone else (for example the uploader
+    after an admin approved their file). Only .chat.id, .message_id and .from_user.id are used."""
+    def __init__(self, chat_id, message_id, user_id):
+        self.chat = _ChatRef(chat_id)
+        self.message_id = message_id
+        self.from_user = _ChatRef(user_id)
+
+
+def _quarantine_path(token):
+    if not _TOKEN_RE.fullmatch(token or ''):
+        raise ValueError('bad review token')
+    return os.path.join(QUARANTINE_DIR, token + '.bin')
+
+
+def _remove_quietly(path):
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except OSError as exc:
+        logger.warning('Could not remove %s: %s', path, exc)
+
+
+def _file_sha256(path):
+    """SHA-256 of a file on disk (streamed), or None when it cannot be read."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, 'rb') as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _safe_send(chat_id, text, **kwargs):
+    try:
+        return bot.send_message(chat_id, text, parse_mode='HTML', **kwargs)
+    except Exception as exc:
+        logger.warning('Could not message %s: %s', chat_id, type(exc).__name__)
+        return None
+
+
+# ---- stored verdicts -------------------------------------------------------------------
+def save_scan_record(user_id, file_name, result, decision=''):
+    """Remember the latest verdict for a hosted file. decision: auto / approved / admin / rescan / rejected / ''."""
+    reasons = json.dumps(result.get('reasons', [])[:20])
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            conn.execute('INSERT OR REPLACE INTO file_scans (user_id, file_name, level, score, reasons, sha256, scanned_at, decision) '
+                         'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                         (user_id, file_name, result.get('level', THREAT_MEDIUM), int(result.get('score', 0)), reasons,
+                          result.get('sha256', ''), datetime.now().isoformat(timespec='seconds'), decision))
+            conn.commit()
+        except sqlite3.Error as exc:
+            logger.error('Could not save scan record for %s/%s: %s', user_id, file_name, exc)
+        finally:
+            conn.close()
+
+
+def set_scan_decision(user_id, file_name, decision):
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            conn.execute('UPDATE file_scans SET decision = ? WHERE user_id = ? AND file_name = ?', (decision, user_id, file_name))
+            conn.commit()
+        except sqlite3.Error as exc:
+            logger.error('Could not update scan decision: %s', exc)
+        finally:
+            conn.close()
+
+
+def get_scan_record(user_id, file_name):
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            row = conn.execute('SELECT level, score, reasons, sha256, scanned_at, decision FROM file_scans '
+                               'WHERE user_id = ? AND file_name = ?', (user_id, file_name)).fetchone()
+        except sqlite3.Error:
+            row = None
+        finally:
+            conn.close()
+    if not row:
+        return None
+    try:
+        reasons = json.loads(row[2] or '[]')
+    except ValueError:
+        reasons = []
+    return {'level': row[0], 'score': row[1], 'reasons': reasons, 'sha256': row[3] or '', 'scanned_at': row[4], 'decision': row[5] or ''}
+
+
+def get_scan_map(user_id):
+    """{file_name: (level, decision)} for one user, in a single query (used by the file list)."""
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            rows = conn.execute('SELECT file_name, level, decision FROM file_scans WHERE user_id = ?', (user_id,)).fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            conn.close()
+    return {name: (level, decision or '') for name, level, decision in rows}
+
+
+def _badge_for(level, decision=''):
+    if level not in THREAT_BADGE:
+        return '⚪'
+    if level == THREAT_MEDIUM and decision in ('approved', 'admin'):
+        return '🟡✅'
+    return THREAT_BADGE[level]
+
+
+def _scan_upload(data, ext, name):
+    """Static scan of freshly uploaded bytes. Never raises: any problem becomes a MEDIUM 'unreadable' verdict."""
+    try:
+        if ext == '.zip':
+            fd, tmp_path = tempfile.mkstemp(prefix='demon_scan_', suffix='.zip')
+            os.close(fd)
+            try:
+                with open(tmp_path, 'wb') as handle:
+                    handle.write(data)
+                result = scan_zip_file(tmp_path)
+            finally:
+                _remove_quietly(tmp_path)
+            result['file'] = name
+            result['size'] = len(data)
+            result['sha256'] = hashlib.sha256(data).hexdigest()
+            return result
+        return scan_bytes(data, ext[1:], name)
+    except Exception:
+        logger.exception('Scanner failed on %s; treating as MEDIUM', name)
+        result = score_findings([('unreadable', 1, 'scanner error')])
+        result.update({'file': name, 'type': ext[1:], 'size': len(data), 'scanner': SCANNER_VERSION,
+                       'sha256': hashlib.sha256(data).hexdigest()})
+        return result
+
+
+def _scan_disk_file(path, file_type):
+    """Static scan of a file that is already stored on disk (never executes it)."""
+    try:
+        with open(path, 'rb') as handle:
+            data = handle.read(SCAN_MAX_SOURCE_BYTES + 1)
+        result = scan_bytes(data, file_type, os.path.basename(path))
+    except Exception:
+        logger.exception('Scanner failed on %s; treating as MEDIUM', path)
+        result = score_findings([('unreadable', 1, 'scanner error')])
+        result.update({'file': os.path.basename(path), 'type': file_type, 'scanner': SCANNER_VERSION})
+    result['sha256'] = _file_sha256(path) or result.get('sha256', '')
+    return result
+
+
+def _note_scan_event(user_id, file_name, level, what):
+    RECENT_SCANS.append((time.time(), user_id, file_name, level, what))
+
+
+def _reason_lines_html(result, limit=5, details=False):
+    lines = []
+    for reason in (result.get('reasons') or [])[:limit]:
+        where = f" (line {reason['lines'][0]})" if reason.get('lines') else ''
+        lines.append(f"• {html_escape(str(reason.get('text', '')))}{where}")
+        if details and reason.get('details'):
+            lines.append('   <i>' + html_escape(', '.join(str(x) for x in reason['details'][:3])[:120]) + '</i>')
+    extra = len(result.get('reasons') or []) - limit
+    if extra > 0:
+        lines.append(f'• ...and {extra} more')
+    return '\n'.join(lines)
+
+
+def _user_verdict_text(result, file_name, outcome):
+    """What the uploader sees. outcome: 'auto' (LOW), 'review' (MEDIUM) or 'rejected' (HIGH)."""
+    level = result['level']
+    head = f"{THREAT_BADGE[level]} <b>Threat level: {THREAT_NAME[level]}</b> (score {result.get('score', 0)})\n📄 <code>{html_escape(file_name)}</code>\n"
+    if outcome == 'auto':
+        return head + '\nNo risky behaviour found. Starting it automatically...'
+    why = _reason_lines_html(result, 5)
+    if outcome == 'review':
+        return (head + '\nSome things in this file need an admin to look at them:\n' + why +
+                '\n\n⏳ It was <b>not started</b>. I sent it to the admin for approval and will message you with the decision.')
+    return (head + '\nWhy this was stopped:\n' + why +
+            '\n\n⛔ <b>Rejected.</b> The file was not started and not saved. Remove the flagged parts and upload it again.')
+
+
+# ---- review registry -----------------------------------------------------------------------
+def _review_db_save(entry):
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            conn.execute('INSERT OR REPLACE INTO pending_reviews (token, user_id, file_name, file_type, level, score, reasons, '
+                         'sha256, created, chat_id, msg_id, uploader, admin_msgs, kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                         (entry['token'], entry['user_id'], entry['file_name'], entry['file_type'], entry['level'], entry['score'],
+                          json.dumps(entry['reasons'][:20]), entry['sha256'], entry['created'], entry['chat_id'],
+                          entry['msg_id'], entry['uploader'], json.dumps(entry['admin_msgs']), entry['kind']))
+            conn.commit()
+        except sqlite3.Error as exc:
+            logger.error('Could not save review %s: %s', entry.get('token'), exc)
+        finally:
+            conn.close()
+
+
+def _review_db_delete(token):
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            conn.execute('DELETE FROM pending_reviews WHERE token = ?', (token,))
+            conn.commit()
+        except sqlite3.Error as exc:
+            logger.error('Could not delete review %s: %s', token, exc)
+        finally:
+            conn.close()
+
+
+def _reviews_load():
+    """Reload the review queue from the database (startup and after a restore).
+    Rows whose held file is gone are dropped, and held files without a row are deleted."""
+    loaded = {}
+    dropped = []
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            rows = conn.execute('SELECT token, user_id, file_name, file_type, level, score, reasons, sha256, created, chat_id, '
+                                'msg_id, uploader, admin_msgs, kind FROM pending_reviews').fetchall()
+        except sqlite3.Error as exc:
+            logger.error('Could not read pending reviews: %s', exc)
+            rows = []
+        finally:
+            conn.close()
+    for row in rows:
+        token = row[0]
+        if not _TOKEN_RE.fullmatch(token or ''):
+            dropped.append(token)
+            continue
+        try:
+            reasons = json.loads(row[6] or '[]')
+            admin_msgs = {str(k): v for k, v in json.loads(row[12] or '{}').items()}
+        except ValueError:
+            reasons, admin_msgs = [], {}
+        kind = row[13] or 'upload'
+        if kind == 'upload' and not os.path.isfile(_quarantine_path(token)):
+            dropped.append(token)
+            continue
+        loaded[token] = {'token': token, 'user_id': row[1], 'file_name': row[2], 'file_type': row[3], 'level': row[4],
+                         'score': row[5], 'reasons': reasons, 'sha256': row[7] or '', 'created': row[8] or time.time(),
+                         'chat_id': row[9], 'msg_id': row[10], 'uploader': row[11] or '', 'admin_msgs': admin_msgs,
+                         'kind': kind, 'status': 'pending'}
+    for token in dropped:
+        _review_db_delete(token)
+    with REVIEW_LOCK:
+        PENDING_REVIEWS.clear()
+        PENDING_REVIEWS.update(loaded)
+        if os.path.isdir(QUARANTINE_DIR):
+            for name in os.listdir(QUARANTINE_DIR):
+                if name.endswith('.bin') and _TOKEN_RE.fullmatch(name[:-4]) and name[:-4] not in loaded:
+                    _remove_quietly(os.path.join(QUARANTINE_DIR, name))
+    if loaded or dropped:
+        logger.info('Review queue loaded: %s waiting, %s stale dropped', len(loaded), len(dropped))
+
+
+def _pending_count():
+    with REVIEW_LOCK:
+        return sum(1 for item in PENDING_REVIEWS.values() if item['status'] == 'pending')
+
+
+def _user_pending_count(user_id):
+    with REVIEW_LOCK:
+        return sum(1 for item in PENDING_REVIEWS.values() if item['user_id'] == user_id)
+
+
+def _review_text(entry, expanded=False, outcome=None):
+    level = entry['level']
+    kind_note = 'Upload waiting for approval' if entry['kind'] == 'upload' else 'Hosted file needs a security decision'
+    created = datetime.fromtimestamp(entry['created']).strftime('%d %b %H:%M')
+    reasons = _reason_lines_html(entry, 12 if expanded else 3, details=expanded) or '• (no details stored)'
+    lines = ["<b>🛡 SECURITY REVIEW</b>\n━━━━━━━━━━━━━━━━━━",
+             f"<i>{kind_note}</i>",
+             f"📄 <b>File:</b> <code>{html_escape(entry['file_name'])}</code> ({html_escape(entry['file_type'])})",
+             f"👤 <b>From:</b> {html_escape(entry['uploader'] or 'user')} (<code>{entry['user_id']}</code>)",
+             f"{THREAT_BADGE[level]} <b>Threat level:</b> {THREAT_NAME[level]} (score {entry['score']})",
+             f"🕒 <b>Received:</b> {created}",
+             f"🔑 <b>Fingerprint:</b> <code>{html_escape(entry['sha256'][:12])}</code>",
+             '', '<b>Flagged because:</b>', reasons]
+    if outcome:
+        lines += ['', outcome]
+    else:
+        lines += ['', '<i>Approve starts it. Reject deletes it. Nothing runs until you decide.</i>']
+    return '\n'.join(lines)
+
+
+def _review_markup(entry, expanded=False, in_panel=False):
+    token = entry['token']
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(types.InlineKeyboardButton('✅ Approve & run', callback_data=f'rv_a_{token}'),
+           types.InlineKeyboardButton('❌ Reject', callback_data=f'rv_r_{token}'))
+    toggle = (types.InlineKeyboardButton('🔼 Less detail', callback_data=f'rv_s_{token}') if expanded
+              else types.InlineKeyboardButton('🔍 More detail', callback_data=f'rv_d_{token}'))
+    kb.row(toggle, types.InlineKeyboardButton('📄 Get file to read', callback_data=f'rv_f_{token}'))
+    if in_panel:
+        kb.row(types.InlineKeyboardButton('🔙 Review queue', callback_data='sec_queue'),
+               types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
+    else:
+        kb.row(types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
+    return kb
+
+
+def _decided_markup():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
+    return kb
+
+
+def _review_edit_all(entry, text, markup, skip_message_id=None):
+    """Update every admin's copy of a review message so nobody sees stale Approve/Reject buttons."""
+    for admin_key, message_id in list(entry.get('admin_msgs', {}).items()):
+        if skip_message_id is not None and message_id == skip_message_id and str(admin_key) == str(entry.get('_acting_chat', '')):
+            continue
+        try:
+            bot.edit_message_text(text, int(admin_key), message_id, parse_mode='HTML', reply_markup=markup)
+        except Exception as exc:
+            logger.debug('Could not update review message for %s: %s', admin_key, type(exc).__name__)
+
+
+def _submit_for_review(user_id, uploader, chat_id, msg_id, file_name, file_type, data, result, kind='upload'):
+    """Hold a MEDIUM upload (or flag an existing hosted file) and ask every admin. Returns (token, error_text)."""
+    _expire_reviews()
+    token = None
+    with REVIEW_LOCK:
+        if len(PENDING_REVIEWS) >= REVIEW_MAX_TOTAL:
+            return None, 'Too many files are waiting for review right now. Please try again later.'
+        if sum(1 for item in PENDING_REVIEWS.values() if item['user_id'] == user_id) >= REVIEW_MAX_PER_USER:
+            return None, f'You already have {REVIEW_MAX_PER_USER} files waiting for review. Please wait for a decision first.'
+        if any(item['user_id'] == user_id and item['file_name'] == file_name for item in PENDING_REVIEWS.values()):
+            return None, 'This file is already waiting for admin review.'
+        for _ in range(10):
+            candidate = secrets.token_hex(4)
+            if candidate not in PENDING_REVIEWS:
+                token = candidate
+                break
+        if token is None:
+            return None, 'Could not queue the file. Please try again.'
+        entry = {'token': token, 'user_id': user_id, 'file_name': file_name, 'file_type': file_type, 'level': result['level'],
+                 'score': result.get('score', 0), 'reasons': list(result.get('reasons', []))[:20], 'sha256': result.get('sha256', ''),
+                 'created': time.time(), 'chat_id': chat_id, 'msg_id': msg_id, 'uploader': uploader, 'admin_msgs': {},
+                 'kind': kind, 'status': 'pending'}
+        if kind == 'upload':
+            try:
+                os.makedirs(QUARANTINE_DIR, mode=0o700, exist_ok=True)
+                fd = os.open(_quarantine_path(token), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, 'wb') as handle:
+                    handle.write(data)
+            except OSError as exc:
+                logger.error('Could not hold upload for review: %s', exc)
+                return None, 'Could not store the file for review. Please try again later.'
+        PENDING_REVIEWS[token] = entry
+    _review_db_save(entry)
+    text, markup = _review_text(entry), _review_markup(entry)
+    for admin_id in sorted(admin_ids):
+        sent = _safe_send(admin_id, text, reply_markup=markup)
+        if sent is not None:
+            entry['admin_msgs'][str(admin_id)] = sent.message_id
+    _review_db_save(entry)
+    logger.info('Review %s queued: user=%s file=%s level=%s kind=%s admins_notified=%s', token, user_id, file_name,
+                result['level'], kind, len(entry['admin_msgs']))
+    return token, ''
+
+
+def _expire_reviews():
+    """Drop reviews nobody answered for REVIEW_TTL, tell the user and clear the admin buttons."""
+    now = time.time()
+    expired = []
+    with REVIEW_LOCK:
+        for token, entry in list(PENDING_REVIEWS.items()):
+            if entry['status'] == 'pending' and now - entry['created'] > REVIEW_TTL:
+                expired.append(PENDING_REVIEWS.pop(token))
+                _remove_quietly(_quarantine_path(token) if entry['kind'] == 'upload' else None)
+    for entry in expired:
+        _review_db_delete(entry['token'])
+        _note_scan_event(entry['user_id'], entry['file_name'], entry['level'], 'expired')
+        _review_edit_all(entry, _review_text(entry, outcome='⌛ <b>Expired</b> with no decision.'), _decided_markup())
+        _safe_send(entry['chat_id'], f"⌛ Your file <code>{html_escape(entry['file_name'])}</code> was not reviewed in time and was removed. "
+                                     'Please upload it again if you still need it.')
+
+
+def _deploy_upload(user_id, file_name, file_type, data, reply_obj, result, decision):
+    """Store an accepted upload and start it. Returns (ok, error_text). Only reached after LOW or admin approval."""
+    user_folder = get_user_folder(user_id)
+    if file_type == 'zip':
+        temp_dir = tempfile.mkdtemp(prefix=f'user_{user_id}_zip_')
+        try:
+            zip_path = os.path.join(temp_dir, file_name)
+            with open(zip_path, 'wb') as handle:
+                handle.write(data)
+            ok = process_zip_file(zip_path, user_id, user_folder, file_name, reply_obj, temp_dir, scan=(result, decision))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return bool(ok), ('' if ok else 'The archive could not be set up. The reason was sent to you.')
+    file_path = os.path.join(user_folder, file_name)
+    try:
+        fd = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return False, f'{file_name} already exists in your storage. Rename it or delete the old one first.'
+    with os.fdopen(fd, 'wb') as handle:
+        handle.write(data)
+    record = dict(result)
+    record['sha256'] = _file_sha256(file_path) or result.get('sha256', '')
+    save_scan_record(user_id, file_name, record, decision)
+    if file_type == 'js':
+        handle_js_file(file_path, user_id, user_folder, file_name, reply_obj)
+    else:
+        handle_py_file(file_path, user_id, user_folder, file_name, reply_obj)
+    return True, ''
+
+
+def _start_hosted(owner_id, file_name, file_type, reply_obj):
+    user_folder = get_user_folder(owner_id)
+    file_path = os.path.join(user_folder, file_name)
+    _reset_restart_state(owner_id, file_name)
+    target = run_js_script if file_type == 'js' else run_script
+    threading.Thread(target=target, args=(file_path, owner_id, user_folder, file_name, reply_obj)).start()
+
+
+# ---- admin decisions ------------------------------------------------------------------------
+def _review_claim(token, new_status='working'):
+    """Atomically take a pending review so two admins cannot decide it twice. Returns the entry or None."""
+    with REVIEW_LOCK:
+        entry = PENDING_REVIEWS.get(token)
+        if entry is None or entry['status'] != 'pending':
+            return None
+        entry['status'] = new_status
+        return entry
+
+
+def _review_release(token):
+    with REVIEW_LOCK:
+        entry = PENDING_REVIEWS.get(token)
+        if entry is not None:
+            entry['status'] = 'pending'
+
+
+def _review_forget(entry):
+    with REVIEW_LOCK:
+        PENDING_REVIEWS.pop(entry['token'], None)
+        if entry['kind'] == 'upload':
+            _remove_quietly(_quarantine_path(entry['token']))
+    _review_db_delete(entry['token'])
+
+
+def _review_approve(call, token):
+    entry = _review_claim(token)
+    if entry is None:
+        bot.answer_callback_query(call.id, 'Someone already handled this request.', show_alert=True)
+        _safe_clear_buttons(call)
+        return
+    admin_name = html_escape(call.from_user.first_name or 'Admin')
+    bot.answer_callback_query(call.id, '✅ Approved. Starting it now...')
+    ok, err = False, 'Unknown problem.'
+    try:
+        user_id, file_name, file_type = entry['user_id'], entry['file_name'], entry['file_type']
+        reply_obj = _ReplyTarget(entry['chat_id'], entry['msg_id'], user_id)
+        if is_user_banned(user_id):
+            err = 'That user is banned.'
+        elif entry['kind'] == 'upload':
+            with open(_quarantine_path(token), 'rb') as handle:
+                data = handle.read()
+            if hashlib.sha256(data).hexdigest() != entry['sha256']:
+                err = 'The held file no longer matches its fingerprint, so it was not started.'
+            elif get_user_file_count(user_id) >= get_user_file_limit(user_id):
+                err = 'The user has reached their file limit.'
+            else:
+                ok, err = _deploy_upload(user_id, file_name, file_type, data, reply_obj, entry, 'approved')
+        else:
+            path = os.path.join(get_user_folder(user_id), file_name)
+            current = _file_sha256(path)
+            if current is None:
+                err = 'The file is no longer in the user storage.'
+            elif current != entry['sha256']:
+                err = 'The file changed after it was scanned. Ask the user to start it again so it is re-checked.'
+            else:
+                set_scan_decision(user_id, file_name, 'approved')
+                _start_hosted(user_id, file_name, file_type, reply_obj)
+                ok = True
+    except Exception:
+        logger.exception('Approving review %s failed', token)
+        ok, err = False, 'Something went wrong while starting the file.'
+    if not ok:
+        _review_release(token)
+        notice = _review_text(entry, outcome=f'⚠️ <b>Could not start:</b> {html_escape(err)}\nIt is still waiting.')
+        try:
+            bot.edit_message_text(notice, call.message.chat.id, call.message.message_id, parse_mode='HTML',
+                                  reply_markup=_review_markup(entry, in_panel=True))
+        except Exception:
+            _safe_send(call.message.chat.id, f'⚠️ Could not start <code>{html_escape(entry["file_name"])}</code>: {html_escape(err)}')
+        return
+    _review_forget(entry)
+    _note_scan_event(entry['user_id'], entry['file_name'], entry['level'], 'approved')
+    logger.info('Review %s approved by %s', token, call.from_user.id)
+    outcome = f'✅ <b>Approved</b> by {admin_name} and started.'
+    _review_edit_all(entry, _review_text(entry, outcome=outcome), _decided_markup())
+    try:
+        bot.edit_message_text(_review_text(entry, outcome=outcome), call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=_decided_markup())
+    except Exception:
+        pass
+    _safe_send(entry['chat_id'], f"✅ An admin approved <code>{html_escape(entry['file_name'])}</code>. It is starting now.")
+
+
+def _review_reject(call, token):
+    entry = _review_claim(token)
+    if entry is None:
+        bot.answer_callback_query(call.id, 'Someone already handled this request.', show_alert=True)
+        _safe_clear_buttons(call)
+        return
+    bot.answer_callback_query(call.id, '❌ Rejected.')
+    if entry['kind'] == 'existing':
+        set_scan_decision(entry['user_id'], entry['file_name'], 'rejected')
+    _review_forget(entry)
+    _note_scan_event(entry['user_id'], entry['file_name'], entry['level'], 'rejected')
+    logger.info('Review %s rejected by %s', token, call.from_user.id)
+    outcome = f"❌ <b>Rejected</b> by {html_escape(call.from_user.first_name or 'Admin')}. The file will not run."
+    _review_edit_all(entry, _review_text(entry, outcome=outcome), _decided_markup())
+    try:
+        bot.edit_message_text(_review_text(entry, outcome=outcome), call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=_decided_markup())
+    except Exception:
+        pass
+    _safe_send(entry['chat_id'], f"❌ An admin rejected <code>{html_escape(entry['file_name'])}</code> for security reasons. It was not started.")
+
+
+def _safe_clear_buttons(call):
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=_decided_markup())
+    except Exception:
+        pass
+
+
+def review_callback(call):
+    """Routes rv_a_ / rv_r_ / rv_d_ / rv_s_ / rv_f_ / rv_o_ buttons (admin only, checked by the caller)."""
+    parts = (call.data or '').split('_', 2)
+    if len(parts) != 3 or not _TOKEN_RE.fullmatch(parts[2]):
+        bot.answer_callback_query(call.id, 'That button is not valid any more.', show_alert=True)
+        return
+    action, token = parts[1], parts[2]
+    if action == 'a':
+        return _review_approve(call, token)
+    if action == 'r':
+        return _review_reject(call, token)
+    with REVIEW_LOCK:
+        entry = PENDING_REVIEWS.get(token)
+        entry = dict(entry) if entry else None
+    if entry is None:
+        bot.answer_callback_query(call.id, 'This request was already handled or has expired.', show_alert=True)
+        _safe_clear_buttons(call)
+        return
+    in_panel = action == 'o'
+    if action in ('d', 's', 'o'):
+        expanded = action == 'd'
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text(_review_text(entry, expanded=expanded), call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=_review_markup(entry, expanded=expanded, in_panel=in_panel))
+        return
+    if action == 'f':
+        path = _quarantine_path(token) if entry['kind'] == 'upload' else os.path.join(get_user_folder(entry['user_id']), entry['file_name'])
+        if not os.path.isfile(path):
+            bot.answer_callback_query(call.id, 'The file is not available any more.', show_alert=True)
+            return
+        bot.answer_callback_query(call.id, 'Sending a copy to read...')
+        with open(path, 'rb') as handle:
+            bot.send_document(call.message.chat.id, types.InputFile(handle, file_name=entry['file_name']),
+                              caption='Review copy. Read it, do not run it.')
+        return
+    bot.answer_callback_query(call.id, 'Unknown action.')
+
+
+# ---- launch gate ------------------------------------------------------------------------------
+def launch_gate(owner_id, file_name, file_type, actor_id, queue=True, admin_override=True):
+    """Decide whether a hosted file may be started. Returns (allowed, note_html).
+    A stored verdict is only trusted while the file on disk still has the fingerprint that was scanned;
+    otherwise the file is scanned again first. HIGH never runs. MEDIUM runs only after approval."""
+    path = os.path.join(get_user_folder(owner_id), file_name)
+    sha = _file_sha256(path)
+    if sha is None:
+        return True, ''        # missing file: the caller already reports that
+    rec = get_scan_record(owner_id, file_name)
+    if not rec or rec['sha256'] != sha:
+        result = _scan_disk_file(path, file_type)
+        save_scan_record(owner_id, file_name, result, 'rescan' if result['level'] == THREAT_LOW else '')
+        rec = {'level': result['level'], 'score': result['score'], 'reasons': result['reasons'], 'sha256': sha,
+               'decision': 'rescan' if result['level'] == THREAT_LOW else ''}
+        _note_scan_event(owner_id, file_name, result['level'], 'rescan')
+    level, decision = rec['level'], rec['decision']
+    head = f"{THREAT_BADGE.get(level, '⚪')} <b>Threat level: {THREAT_NAME.get(level, level)}</b> (score {rec['score']})"
+    why = _reason_lines_html(rec, 4)
+    if level == THREAT_HIGH:
+        return False, f"{head}\n{why}\n\n⛔ <b>Blocked.</b> High-threat files are never started. Delete it from this panel."
+    if decision == 'rejected':
+        return False, f"{head}\n\n⛔ An admin rejected this file earlier, so it will not start."
+    if level == THREAT_LOW or decision in ('approved', 'admin'):
+        return True, ''
+    if admin_override and (owner_id in admin_ids or actor_id in admin_ids):
+        set_scan_decision(owner_id, file_name, 'admin')
+        _note_scan_event(owner_id, file_name, level, 'admin start')
+        return True, ''
+    if not queue:
+        return False, f"{head}\n{why}\n\n🕵️ Needs an admin decision first."
+    owner_chat = owner_id
+    token, err = _submit_for_review(owner_id, str(owner_id), owner_chat, None, file_name, file_type, None,
+                                    dict(rec, file=file_name), kind='existing')
+    if token:
+        with REVIEW_LOCK:
+            item = PENDING_REVIEWS.get(token)
+            if item is not None:
+                item['msg_id'] = None
+        return False, f"{head}\n{why}\n\n⏳ <b>Not started.</b> I sent it to the admin for approval."
+    return False, f"{head}\n{why}\n\n⏳ <b>Not started.</b> {html_escape(err)}"
+
+
+# ---- Security Center ----------------------------------------------------------------------
+def _scan_counts():
+    counts = {'low': 0, 'medium_ok': 0, 'medium': 0, 'high': 0}
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            rows = conn.execute('SELECT level, decision, COUNT(*) FROM file_scans GROUP BY level, decision').fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            conn.close()
+    for level, decision, count in rows:
+        if level == THREAT_LOW:
+            counts['low'] += count
+        elif level == THREAT_HIGH:
+            counts['high'] += count
+        elif decision in ('approved', 'admin'):
+            counts['medium_ok'] += count
+        else:
+            counts['medium'] += count
+    return counts
+
+
+def _security_center_view():
+    counts = _scan_counts()
+    scanned = sum(counts.values())
+    hosted = sum(len(items) for items in user_files.values())
+    pending = _pending_count()
+    lines = ['<b>🛡 SECURITY CENTER</b>\n━━━━━━━━━━━━━━━━━━',
+             f'📥 <b>Waiting for your decision:</b> {pending}',
+             '',
+             '<b>Hosted files by threat level</b>',
+             f"🟢 Low: {counts['low']}",
+             f"🟡 Medium (approved): {counts['medium_ok']}",
+             f"🟡 Medium (not approved): {counts['medium']}",
+             f"🔴 High: {counts['high']}",
+             f"⚪ Not scanned yet: {max(0, hosted - scanned)}"]
+    if RECENT_SCANS:
+        lines += ['', '<b>Recent activity</b>']
+        for stamp, uid, name, level, what in list(RECENT_SCANS)[-5:][::-1]:
+            lines.append(f"{THREAT_BADGE.get(level, '⚪')} {time.strftime('%H:%M', time.localtime(stamp))} "
+                         f"<code>{html_escape(name[:24])}</code> u{uid} - {html_escape(what)}")
+    lines += ['', f'<i>Updated {datetime.now().strftime("%H:%M:%S")}. Scanner v{SCANNER_VERSION}.</i>']
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(types.InlineKeyboardButton(f'📥 Review queue ({pending})', callback_data='sec_queue'),
+           types.InlineKeyboardButton('🔄 Refresh', callback_data='sec_center'))
+    kb.row(types.InlineKeyboardButton('🔍 Rescan hosted files', callback_data='sec_rescan'))
+    kb.row(types.InlineKeyboardButton('👑 Admin Center', callback_data='admin_dashboard'),
+           types.InlineKeyboardButton('🏠 Main Menu', callback_data='back_to_main'))
+    return '\n'.join(lines), kb
+
+
+def security_center_callback(call):
+    bot.answer_callback_query(call.id)
+    _expire_reviews()
+    text, kb = _security_center_view()
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
+
+
+def security_queue_callback(call):
+    bot.answer_callback_query(call.id)
+    _expire_reviews()
+    with REVIEW_LOCK:
+        items = sorted((dict(item) for item in PENDING_REVIEWS.values()), key=lambda item: item['created'])
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    if items:
+        text = f'<b>📥 REVIEW QUEUE</b>\n━━━━━━━━━━━━━━━━━━\n{len(items)} waiting. Tap one to read the reasons and decide.'
+        for item in items[:10]:
+            label = f"{THREAT_BADGE[item['level']]} {item['file_name'][:24]} - {(item['uploader'] or str(item['user_id']))[:14]}"
+            kb.add(types.InlineKeyboardButton(label, callback_data=f"rv_o_{item['token']}"))
+        if len(items) > 10:
+            text += f'\n<i>Showing the oldest 10 of {len(items)}.</i>'
+    else:
+        text = '<b>📥 REVIEW QUEUE</b>\n━━━━━━━━━━━━━━━━━━\n✅ Nothing is waiting. All clear.'
+    kb.row(types.InlineKeyboardButton('🔄 Refresh', callback_data='sec_queue'),
+           types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
+
+
+def security_rescan_callback(call):
+    """Scan every hosted file again with the current scanner. Approvals stay valid only while the file is unchanged."""
+    if not SCAN_RESCAN_LOCK.acquire(blocking=False):
+        bot.answer_callback_query(call.id, 'A rescan is already running.', show_alert=True)
+        return
+    try:
+        bot.answer_callback_query(call.id, 'Scanning hosted files...')
+        entries = [(uid, name, ftype) for uid, items in list(user_files.items()) for name, ftype in list(items)]
+        capped = len(entries) > RESCAN_ALL_CAP
+        entries = entries[:RESCAN_ALL_CAP]
+        try:
+            bot.edit_message_text(f'<b>🔍 Scanning {len(entries)} hosted file(s)...</b>\nThis only reads the files. Nothing is started.',
+                                  call.message.chat.id, call.message.message_id, parse_mode='HTML')
+        except Exception:
+            pass
+        changed, high_names, missing = 0, [], 0
+        for uid, name, ftype in entries:
+            path = os.path.join(get_user_folder(uid), name)
+            if not os.path.isfile(path):
+                missing += 1
+                continue
+            old = get_scan_record(uid, name)
+            result = _scan_disk_file(path, ftype)
+            keep = old['decision'] if old and old['sha256'] == result['sha256'] and old['decision'] in ('approved', 'admin', 'rejected') else ''
+            if not old or old['level'] != result['level']:
+                changed += 1
+            save_scan_record(uid, name, result, keep or ('rescan' if result['level'] == THREAT_LOW else ''))
+            if result['level'] == THREAT_HIGH:
+                high_names.append(f'{name} (u{uid})')
+        _note_scan_event(call.from_user.id, 'all hosted files', THREAT_LOW, f'rescan {len(entries)}')
+        summary = f'<b>✅ Rescan finished</b>: {len(entries) - missing} file(s) checked, {changed} verdict(s) changed.'
+        if missing:
+            summary += f'\n{missing} file(s) were missing on disk.'
+        if capped:
+            summary += f'\nOnly the first {RESCAN_ALL_CAP} files were checked.'
+        if high_names:
+            summary += '\n\n🔴 <b>High threat (blocked from starting):</b>\n' + '\n'.join('• ' + html_escape(n) for n in high_names[:8])
+            summary += '\nAny of these that are running right now keep running until you stop them.'
+        text, kb = _security_center_view()
+        bot.edit_message_text(summary + '\n\n' + text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
+    finally:
+        SCAN_RESCAN_LOCK.release()
+
+
+SCAN_RESCAN_LOCK = threading.Lock()
+_reviews_load()   # uploads that were waiting for an admin before the last restart
+
 
 # --- Mandatory Channels Functions ---
 _MEMBER_CACHE = {}          # (user_id, channel_id) -> time of last positive answer
@@ -1201,6 +2832,7 @@ def remove_user_file_db(user_id, file_name):
         c = conn.cursor()
         try:
             c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
+            c.execute('DELETE FROM file_scans WHERE user_id = ? AND file_name = ?', (user_id, file_name))
             conn.commit()
             if user_id in user_files:
                 user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
@@ -1347,6 +2979,7 @@ def create_main_menu_inline(user_id):
             types.InlineKeyboardButton('👥 User Management', callback_data='user_management'),
             types.InlineKeyboardButton('📢 Broadcast', callback_data='broadcast')
         )
+        markup.row(types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
     return markup
 
 
@@ -1945,6 +3578,7 @@ def _reload_memory_state():
         user_limits.clear()
         mandatory_channels.clear()
         load_data()
+    _reviews_load()
 
 
 def _replace_live_database(source_path):
@@ -2599,7 +4233,8 @@ def create_admin_panel():
         types.InlineKeyboardButton('➕ Add Admin', callback_data='add_admin'),
         types.InlineKeyboardButton('➖ Remove Admin', callback_data='remove_admin')
     )
-    markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
+    markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'),
+               types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
     markup.row(types.InlineKeyboardButton('🗄 Database Backup', callback_data='database_backup'),
                types.InlineKeyboardButton('📤 Export Users', callback_data='export_users'))
     markup.row(types.InlineKeyboardButton('📦 Export Full Backup', callback_data='export_database'),
@@ -2700,7 +4335,7 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
                 pending_zip_files.setdefault(user_id, {})[file_name_zip] = downloaded_file_content
                 pending_zip_times[(user_id, file_name_zip)] = time.time()
             
-            bot.reply_to(message, f"⏳ File under security review. You will be notified upon approval.")
+            bot.reply_to(message, "⏳ File under security review. You will be notified upon approval.")
             return
 
         # Process ZIP file if safe
@@ -2717,8 +4352,15 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
             try: shutil.rmtree(temp_dir); logger.info(f"Cleaned temp dir: {temp_dir}")
             except Exception as e: logger.error(f"Failed to clean temp dir {temp_dir}: {e}", exc_info=True)
 
-def process_zip_file(zip_path, user_id, user_folder, file_name_zip, message, temp_dir=None):
-    """Process ZIP file extraction and setup"""
+def process_zip_file(zip_path, user_id, user_folder, file_name_zip, message, temp_dir=None, scan=None):
+    """Process ZIP file extraction and setup. Returns True when the archive was set up and its main script started.
+    scan = (scan_result, decision) from the upload security scan, stored for the main script."""
+    state = {'ok': False}
+    _process_zip_file_impl(zip_path, user_id, user_folder, file_name_zip, message, temp_dir, scan, state)
+    return state['ok']
+
+
+def _process_zip_file_impl(zip_path, user_id, user_folder, file_name_zip, message, temp_dir, scan, state):
     cleanup_temp = False
     if temp_dir is None:
         temp_dir = tempfile.mkdtemp(prefix=f"user_{user_id}_zip_")
@@ -2831,6 +4473,12 @@ def process_zip_file(zip_path, user_id, user_folder, file_name_zip, message, tem
         _reset_restart_state(user_id, main_script_name)
         logger.info(f"Saved main script '{main_script_name}' ({file_type}) for {user_id} from zip.")
         main_script_path = os.path.join(user_folder, main_script_name)
+        if scan:
+            # Remember the archive's verdict for its main script (fingerprint = the file now on disk).
+            scan_record = dict(scan[0])
+            scan_record['sha256'] = _file_sha256(main_script_path) or scan_record.get('sha256', '')
+            save_scan_record(user_id, main_script_name, scan_record, scan[1])
+        state['ok'] = True
         bot.reply_to(message, f"✅ Files extracted. Starting main script: `{main_script_name}`...", parse_mode='Markdown')
 
         # Use user_id as script_owner_id for script key context
@@ -3176,6 +4824,15 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
              return
 
         if attempt == 1:
+            # Last line of defence for every start path (watchdog, Run All, imports). This runs BEFORE the
+            # test run below: HIGH never runs, MEDIUM only after an admin approved it.
+            allowed, gate_note = launch_gate(script_owner_id, file_name, 'py', 0, queue=False, admin_override=False)
+            if not allowed:
+                logger.warning("Security gate stopped %s for user %s", file_name, script_owner_id)
+                bot.send_message(message_obj_for_reply.chat.id, gate_note, parse_mode='HTML')
+                return
+
+        if attempt == 1:
             check_command = [sys.executable, script_path]
             logger.info(f"Running Python pre-check: {' '.join(check_command)}")
             check_proc = None
@@ -3282,6 +4939,15 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
                  user_files[script_owner_id] = [f for f in user_files.get(script_owner_id, []) if f[0] != file_name]
              remove_user_file_db(script_owner_id, file_name)
              return
+
+        if attempt == 1:
+            # Last line of defence for every start path (watchdog, Run All, imports). This runs BEFORE the
+            # test run below: HIGH never runs, MEDIUM only after an admin approved it.
+            allowed, gate_note = launch_gate(script_owner_id, file_name, 'js', 0, queue=False, admin_override=False)
+            if not allowed:
+                logger.warning("Security gate stopped %s for user %s", file_name, script_owner_id)
+                bot.send_message(message_obj_for_reply.chat.id, gate_note, parse_mode='HTML')
+                return
 
         if attempt == 1:
             check_command = ['node', script_path]
@@ -3503,10 +5169,12 @@ def _logic_check_files(message):
         bot.reply_to(message, "📂 Your files:\n\n(No files uploaded yet)")
         return
     markup = types.InlineKeyboardMarkup(row_width=1)
+    scan_map = get_scan_map(user_id)
     for file_name, file_type in sorted(user_files_list):
         is_running = is_bot_running(user_id, file_name) # Use user_id for checking status
         status_icon = "🟢 Running" if is_running else "🔴 Stopped"
-        btn_text = f"{file_name} ({file_type}) - {status_icon}"
+        badge = _badge_for(*scan_map[file_name]) if file_name in scan_map else '⚪'
+        btn_text = f"{badge} {file_name} ({file_type}) - {status_icon}"
         # Callback data includes user_id as script_owner_id
         markup.add(types.InlineKeyboardButton(btn_text, callback_data=f'file_{user_id}_{file_name}'))
     bot.reply_to(message, "📂 Your files:\nClick to manage.", reply_markup=markup, parse_mode='Markdown')
@@ -3728,6 +5396,11 @@ def _logic_run_all_scripts(message_or_call):
                 if os.path.exists(file_path):
                     logger.info(f"Admin {admin_user_id} attempting to start '{file_name}' ({file_type}) for user {target_user_id}.")
                     try:
+                        gate_ok, _gate_note = launch_gate(target_user_id, file_name, file_type, admin_user_id, queue=False, admin_override=False)
+                        if not gate_ok:
+                            error_files_details.append(f"`{file_name}` (User {target_user_id}) - held by security scan")
+                            skipped_files += 1
+                            continue
                         _reset_restart_state(target_user_id, file_name)
                         if file_type == 'py':
                             threading.Thread(target=run_script, args=(file_path, target_user_id, user_folder, file_name, admin_message_obj_for_script_runner)).start()
@@ -3830,7 +5503,6 @@ def command_send_welcome(message):
 
 @bot.message_handler(commands=['account'])
 def command_account(message):
-    kb = create_main_menu_inline(message.from_user.id)
     bot.send_message(message.chat.id, '<b>👤 Account Center</b>\nOpen your account overview from the button below.', parse_mode='HTML', reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('👤 My Account', callback_data='user_account')))
 
 @bot.message_handler(commands=['mybots'])
@@ -3965,6 +5637,51 @@ def _sanitize_upload_filename(raw_name, max_stem=32):
 
 
 # --- Document (File) Handler ---
+def _show_verdict(message, wait_msg, text):
+    """Show the uploader their verdict: edit the 'Processing' message in place, or reply if that fails."""
+    try:
+        bot.edit_message_text(text, message.chat.id, wait_msg.message_id, parse_mode='HTML')
+    except Exception as exc:
+        logger.debug('Could not edit verdict message: %s', type(exc).__name__)
+        _safe_send(message.chat.id, text)
+
+
+def _handle_scanned_upload(message, user_id, chat_id, file_name, file_ext, data, wait_msg):
+    """Scan an uploaded bot file and act on the threat level. Nothing is stored in the user's folder or started
+    before this decides: LOW -> start it, MEDIUM -> hold it and ask the admins, HIGH -> reject and drop it."""
+    result = _scan_upload(data, file_ext, file_name)
+    level = result['level']
+    file_type = file_ext[1:]
+    uploader = message.from_user.first_name or message.from_user.username or str(user_id)
+    _note_scan_event(user_id, file_name, level, 'upload')
+    logger.info('Upload scan: user=%s file=%s level=%s score=%s', user_id, file_name, level, result.get('score'))
+    if level == THREAT_HIGH:
+        _show_verdict(message, wait_msg, _user_verdict_text(result, file_name, 'rejected'))
+        notice = (f"🔴 <b>High-threat upload rejected</b>\n📄 <code>{html_escape(file_name)}</code> from "
+                  f"{html_escape(uploader)} (<code>{user_id}</code>)\n{_reason_lines_html(result, 4)}\n<i>Nothing was saved or run.</i>")
+        for admin_id in sorted(admin_ids):
+            _safe_send(admin_id, notice)
+        return
+    if level == THREAT_MEDIUM and user_id not in admin_ids:
+        token, err = _submit_for_review(user_id, uploader, chat_id, message.message_id, file_name, file_type, data, result)
+        if token:
+            _show_verdict(message, wait_msg, _user_verdict_text(result, file_name, 'review'))
+        else:
+            head = f"{THREAT_BADGE[level]} <b>Threat level: {THREAT_NAME[level]}</b> (score {result.get('score', 0)})\n"
+            _show_verdict(message, wait_msg, head + _reason_lines_html(result, 5) + f"\n\n⛔ <b>Not started.</b> {html_escape(err)}")
+        return
+    decision = 'auto'
+    if level == THREAT_MEDIUM:
+        decision = 'admin'   # an admin uploading their own file is the approver
+        _show_verdict(message, wait_msg, _user_verdict_text(result, file_name, 'review').split('\n\n⏳')[0] +
+                      '\n\n👑 You are an admin, so it is approved by you and starting now.')
+    else:
+        _show_verdict(message, wait_msg, _user_verdict_text(result, file_name, 'auto'))
+    ok, err = _deploy_upload(user_id, file_name, file_type, data, message, result, decision)
+    if not ok and err:
+        _safe_send(chat_id, f'⚠️ {html_escape(err)}')
+
+
 @bot.message_handler(content_types=['document'])
 def handle_file_upload_doc(message):
     user_id = message.from_user.id
@@ -4033,39 +5750,12 @@ def handle_file_upload_doc(message):
             bot.reply_to(message, f"⚠️ <code>{html_escape(file_name)}</code> already exists. Rename the upload before sending it again.", parse_mode='HTML')
             return
 
-        if file_ext == '.zip':
-            handle_zip_file(downloaded_file_content, file_name, message)
-        else:
-            file_path = os.path.join(user_folder, file_name)
-            with open(file_path, 'wb') as f: f.write(downloaded_file_content)
-            logger.info(f"Saved single file to {file_path}")
-            
-            # Security check for script files (lightweight)
-            is_safe, security_msg = check_code_security(file_path, file_ext[1:])
-            if not is_safe:
-                # Send security warning to admin for approval
-                security_warning_msg = f"🚨 File needs approval:\n👤 User: {user_id}\n📁 File: {file_name}\n⚠️ Reason: {security_msg}"
-                markup = types.InlineKeyboardMarkup()
-                markup.row(
-                    types.InlineKeyboardButton("✅ Approve", callback_data=f"approve_file_{user_id}_{file_name}"),
-                    types.InlineKeyboardButton("❌ Reject", callback_data=f"reject_file_{user_id}_{file_name}")
-                )
-                for admin_id in admin_ids:
-                    try:
-                        bot.send_message(admin_id, security_warning_msg, reply_markup=markup)
-                    except Exception as e:
-                        logger.error(f"Failed to send security warning to admin {admin_id}: {e}")
-                
-                bot.reply_to(message, f"⏳ File under security review. You will be notified upon approval.")
-                return
-                
-            # Pass user_id as script_owner_id
-            if file_ext == '.js': handle_js_file(file_path, user_id, user_folder, file_name, message)
-            elif file_ext == '.py': handle_py_file(file_path, user_id, user_folder, file_name, message)
+        # --- Security scan (static, never runs the file). LOW runs, MEDIUM waits for an admin, HIGH is rejected. ---
+        _handle_scanned_upload(message, user_id, chat_id, file_name, file_ext, downloaded_file_content, download_wait_msg)
     except telebot.apihelper.ApiTelegramException as e:
          logger.error(f"Telegram API Error handling file for {user_id}: {e}", exc_info=True)
          if "file is too big" in str(e).lower():
-              bot.reply_to(message, f"❌ Telegram API Error: File too large to download (~20MB limit).")
+              bot.reply_to(message, "❌ Telegram API Error: File too large to download (~20MB limit).")
          else: bot.reply_to(message, f"❌ Telegram API Error: {str(e)}. Try later.")
     except Exception as e:
         logger.error(f"❌ General error handling file for {user_id}: {e}", exc_info=True)
@@ -4162,7 +5852,12 @@ def handle_callbacks(call):
         elif data == 'list_mandatory_channels': admin_required_callback(call, list_mandatory_channels_callback)
         elif data.startswith('remove_channel_'): admin_required_callback(call, process_remove_channel)
         elif data == 'check_subscription_status': check_subscription_status_callback(call)
-        # --- Security Approval Callbacks ---
+        # --- Upload security review + Security Center (admins only) ---
+        elif data.startswith('rv_'): admin_required_callback(call, review_callback)
+        elif data == 'sec_center': admin_required_callback(call, security_center_callback)
+        elif data == 'sec_queue': admin_required_callback(call, security_queue_callback)
+        elif data == 'sec_rescan': admin_required_callback(call, security_rescan_callback)
+        # --- Security Approval Callbacks (older approval buttons that may still be in chats) ---
         elif data.startswith('approve_file_'): admin_required_callback(call, process_approve_file)
         elif data.startswith('reject_file_'): admin_required_callback(call, process_reject_file)
         elif data.startswith('approve_zip_'): admin_required_callback(call, process_approve_zip)
@@ -4378,7 +6073,6 @@ def owner_required_callback(call, func_to_run):
 
 # --- User Callbacks ---
 def manual_install_callback(call):
-    user_id = call.from_user.id
     bot.answer_callback_query(call.id)
     manual_install_module_init(call.message)
 
@@ -4442,10 +6136,12 @@ def check_files_callback(call):
         return
     bot.answer_callback_query(call.id) 
     markup = types.InlineKeyboardMarkup(row_width=1) 
+    scan_map = get_scan_map(user_id)
     for file_name, file_type in sorted(user_files_list): 
         is_running = is_bot_running(user_id, file_name) # Use user_id for status check
         status_icon = "🟢 Running" if is_running else "🔴 Stopped"
-        btn_text = f"{file_name} ({file_type}) - {status_icon}"
+        badge = _badge_for(*scan_map[file_name]) if file_name in scan_map else '⚪'
+        btn_text = f"{badge} {file_name} ({file_type}) - {status_icon}"
         # Callback includes user_id as script_owner_id
         markup.add(types.InlineKeyboardButton(btn_text, callback_data=f'file_{user_id}_{file_name}'))
     markup.row(types.InlineKeyboardButton("📦 Export My Bots", callback_data=f'ubk_{user_id}'),
@@ -4500,6 +6196,26 @@ def file_control_callback(call):
         logger.error(f"Error in file_control_callback for data '{call.data}': {e}", exc_info=True)
         bot.answer_callback_query(call.id, "An error occurred.", show_alert=True)
 
+def _gate_button_start(call, owner_id, file_name, file_type):
+    """Security check for the Start / Restart buttons. Returns True when the file may start. Otherwise the
+    panel is edited in place to show the threat level and what happens next (a running bot is left alone)."""
+    allowed, note = launch_gate(owner_id, file_name, file_type, call.from_user.id)
+    if allowed:
+        return True
+    try:
+        bot.answer_callback_query(call.id, '🛡 Not started - security check')
+    except Exception as exc:
+        logger.debug('answer_callback_query: %s', type(exc).__name__)
+    running = is_bot_running(owner_id, file_name)
+    try:
+        bot.edit_message_text(f"{note}\n\n📄 <code>{html_escape(file_name)}</code>", call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=create_control_buttons(owner_id, file_name, running))
+    except Exception as exc:
+        logger.debug('Could not edit gate note: %s', type(exc).__name__)
+        _safe_send(call.message.chat.id, note, parse_mode='HTML')
+    return False
+
+
 def start_bot_callback(call):
     try:
         _, script_owner_id_str, file_name = call.data.split('_', 2)
@@ -4529,6 +6245,9 @@ def start_bot_callback(call):
             bot.answer_callback_query(call.id, f"⚠️ Script '{file_name}' already running.", show_alert=True)
             try: bot.edit_message_reply_markup(chat_id_for_reply, call.message.message_id, reply_markup=create_control_buttons(script_owner_id, file_name, True))
             except Exception as e: logger.error(f"Error updating buttons (already running): {e}")
+            return
+
+        if not _gate_button_start(call, script_owner_id, file_name, file_type):
             return
 
         RESTART_STATE[_script_key(script_owner_id, file_name)] = {"attempts": 0, "manual_stop": False}
@@ -4652,6 +6371,9 @@ def restart_bot_callback(call):
             remove_user_file_db(script_owner_id, file_name)
             _forget_script(script_key)
             check_files_callback(call); return
+
+        if not _gate_button_start(call, script_owner_id, file_name, file_type):
+            return
 
         bot.answer_callback_query(call.id, f"⏳ Restarting {file_name} for user {script_owner_id}...")
         # Mark it as manually stopped while the old process is killed, so the watchdog does not see the
@@ -6088,14 +7810,14 @@ def bot_performance_callback(call):
             memory_usage = bot_process.memory_info().rss / 1024 / 1024  # MB
             cpu_usage = bot_process.cpu_percent(interval=0.5)
             
-            performance_parts.append(f"\n💾 **Resource Usage:**")
+            performance_parts.append("\n💾 **Resource Usage:**")
             performance_parts.append(f"• Memory: {memory_usage:.1f} MB")
             performance_parts.append(f"• CPU: {cpu_usage:.1f}%")
         except Exception as e:
             performance_parts.append(f"\n⚠️ Resource stats error: {str(e)}")
         
         # Database stats
-        performance_parts.append(f"\n🗄️ **Database:**")
+        performance_parts.append("\n🗄️ **Database:**")
         performance_parts.append(f"• Active Users: {len(active_users)}")
         performance_parts.append(f"• Subscriptions: {len(user_subscriptions)}")
         performance_parts.append(f"• Banned Users: {len(banned_users)}")
