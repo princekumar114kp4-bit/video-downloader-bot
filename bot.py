@@ -9,6 +9,7 @@ import tempfile
 import shutil
 from telebot import types
 import time
+import itertools
 from datetime import datetime, timedelta
 import psutil
 import sqlite3
@@ -21,11 +22,10 @@ import sys
 import atexit
 import requests
 import hashlib
-import math
-import base64
-import zlib
 import secrets
-from collections import deque
+import hmac
+import io
+from urllib.parse import urlsplit, urljoin
 
 # --- Extra imports added by the upgrade ---
 from logging.handlers import RotatingFileHandler
@@ -164,15 +164,6 @@ pending_zip_times = {}  # {(user_id, file_name): time stored}
 PENDING_ZIP_TTL = 6 * 3600
 PENDING_ZIP_MAX_TOTAL = 10  # never keep more than this many archives waiting in memory
 
-# --- Security Settings ---
-SECURITY_CONFIG = {
-    'blocked_modules': ['os.system', 'os', 'zipfile', 'subprocess.Popen', 'subprocess', 'eval', 'exec','compile', '__import__'],
-    'max_file_size': MAX_UPLOAD_MB * 1024 * 1024,
-    'max_script_runtime': 3600,  # 1 hour
-    'allowed_extensions': ['.py', '.js'],
-    'blocked_imports': ['shutil.rmtree', 'subprocess','os.remove', 'os.unlink']
-}
-
 
 def child_env():
     """Environment given to hosted user scripts: same as ours but WITHOUT the hosting bot's secrets."""
@@ -236,6 +227,396 @@ def _retry_after_seconds(exc, default=5):
         return int(match.group(1)) if match else default
 
 
+# --- Reply-keyboard navigation -------------------------------------------------
+# Every screen is a native Telegram reply keyboard that changes with each action. Screens are still
+# described with NavMenu/NavButton (same add/row calls the old inline buttons used); SafeTeleBot turns a
+# NavMenu into a ReplyKeyboardMarkup when it sends it. Pressing a key sends its label as normal text; the
+# text handler below finds the action behind that label for this chat and runs the existing screen code.
+# Note: Telegram does not allow custom (premium) emoji inside reply-keyboard button text, so the colours
+# come from standard coloured emoji. All of the look is in NAV_THEME below.
+NAV_TTL = 6 * 3600           # a keyboard state is forgotten after this many seconds
+NAV_MAX_STATES = 5000        # most chats kept in memory
+NAV_MAX_BUTTONS = 60         # Telegram allows about 100; keep the keyboard readable
+NAV_LABEL_MAX = 46
+NAV_BACK_STACK_MAX = 12
+NAV_CANCEL = '❌ Cancel'
+NAV_HOME = '🏠 Home'
+NAV_BACK = '⬅️ Back'
+NAV_RESERVED = (NAV_CANCEL, NAV_HOME, NAV_BACK)
+NAV_OLD_BUTTON_NOTE = "Ye button purana hai, menu se dobara try karo 👇"
+
+# category -> coloured square, tried in this order against the label text (first match wins)
+NAV_THEME = [
+    ('danger',  '🟥', r'delete|remove|reject|\bban\b|\bstop|kill|wipe|clear'),
+    ('warn',    '🟧', r'restart|refresh|retry|(?<!un)lock|import|restore|expire'),
+    ('success', '🟩', r'start|\brun|approve|confirm|\byes\b|unban|unlock|\bdone|accept|\badd\b|join'),
+    ('admin',   '🟪', r'admin|user management|broadcast|subscription|approval|channel|setting|health|manage'),
+    ('info',    '🟦', r'.'),
+]
+NAV_NUMBERED_PREFIXES = ('file_', 'rv_', 'remove_channel_')
+
+NAV_STATE = {}
+NAV_LOCK = threading.RLock()
+_NAV_CALL_COUNTER = itertools.count(1)
+_NAV_BACK_RX = re.compile(r'^\W*(?:back|🔙|⬅)', re.I | re.U)
+_NAV_LEAD_RX = re.compile(r'^([^\w\s(\[]+)\s*(.*)$', re.S)
+
+
+class NavButton:
+    """One key. Either callback_data (an action) or url (the link is sent when it is tapped)."""
+    def __init__(self, text, callback_data=None, url=None, **_ignored):
+        self.text = str(text)
+        self.callback_data = callback_data
+        self.url = url
+
+
+class NavMenu:
+    """Same building calls as InlineKeyboardMarkup: add() and row()."""
+    def __init__(self, row_width=3, **_ignored):
+        self.row_width = max(1, int(row_width or 3))
+        self.rows = []
+
+    def add(self, *buttons, row_width=None):
+        width = max(1, int(row_width or self.row_width))
+        buttons = [b for b in buttons if b is not None]
+        for i in range(0, len(buttons), width):
+            self.rows.append(list(buttons[i:i + width]))
+        return self
+
+    def row(self, *buttons):
+        buttons = [b for b in buttons if b is not None]
+        if buttons:
+            self.rows.append(list(buttons))
+        return self
+
+
+def _nav_split_label(text):
+    """('emoji', 'rest') where emoji is the leading symbol of the label if there is one."""
+    m = _NAV_LEAD_RX.match(text.strip())
+    if m and not m.group(1).isascii():
+        return m.group(1), m.group(2).strip() or text.strip()
+    return '', text.strip()
+
+
+def _nav_category(text):
+    low = text.lower()
+    for name, square, rx in NAV_THEME:
+        if re.search(rx, low):
+            return square
+    return NAV_THEME[-1][1]
+
+
+def _nav_label(text, action, number=None):
+    emoji, rest = _nav_split_label(text)
+    if number is not None:
+        square = NAV_THEME[-1][1]
+        label = f"{square} {number}. {rest if not emoji else emoji + ' ' + rest}"
+    else:
+        square = _nav_category(rest)
+        label = f"{square} {emoji + ' ' if emoji else ''}{rest}"
+    if len(label) > NAV_LABEL_MAX:
+        label = label[:NAV_LABEL_MAX - 1].rstrip() + '…'
+    return label
+
+
+def _nav_is_main_menu(buttons):
+    acts = {b.callback_data for b in buttons}
+    return 'upload' in acts and 'check_files' in acts
+
+
+def _nav_forget_old():
+    now = time.time()
+    for key in [k for k, v in NAV_STATE.items() if now - v['time'] > NAV_TTL]:
+        NAV_STATE.pop(key, None)
+    if len(NAV_STATE) > NAV_MAX_STATES:
+        for key, _ in sorted(NAV_STATE.items(), key=lambda kv: kv[1]['time'])[:len(NAV_STATE) - NAV_MAX_STATES + 100]:
+            NAV_STATE.pop(key, None)
+
+
+def _nav_get(chat_id):
+    with NAV_LOCK:
+        st = NAV_STATE.get(chat_id)
+        if st and time.time() - st['time'] > NAV_TTL:
+            NAV_STATE.pop(chat_id, None)
+            return None
+        return st
+
+
+def _nav_blank():
+    return {'map': {}, 'rows': [], 'time': time.time(), 'cur': None, 'stack': [], 'seq': 0, 'await': False}
+
+
+def _nav_rows_to_markup(rows):
+    kb = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True, one_time_keyboard=False,
+                                   input_field_placeholder="Button dabao...")
+    for row in rows:
+        kb.row(*[types.KeyboardButton(label) for label in row])
+    return kb
+
+
+def _nav_build(chat_id, menu, cancel_only=False):
+    """Turn a NavMenu into a ReplyKeyboardMarkup and remember what each label does for this chat."""
+    buttons = [b for row in menu.rows for b in row][:NAV_MAX_BUTTONS]
+    main = _nav_is_main_menu(buttons)
+    used = set(NAV_RESERVED)
+    amap, rows = {}, []
+    has_custom_back = False
+    counter = 0
+    for row in menu.rows:
+        out = []
+        for b in row:
+            if b not in buttons:
+                continue
+            action = b.callback_data if b.callback_data is not None else ('url:' + str(b.url))
+            if not main and action == 'back_to_main':
+                continue                                  # the Home key does this
+            number = None
+            if isinstance(action, str) and action.startswith(NAV_NUMBERED_PREFIXES) and not re.match(r'^\W*\d+\.', b.text):
+                counter += 1
+                number = counter
+            label = _nav_label(b.text, action, number)
+            if _NAV_BACK_RX.match(b.text):
+                has_custom_back = True
+            base, n = label, 2
+            while label in used:
+                label = f"{base} ({n})"
+                n += 1
+            used.add(label)
+            amap[label] = action
+            out.append(label)
+        if out:
+            rows.append(out)
+    if not main:
+        tail = []
+        if not has_custom_back:
+            tail.append(NAV_BACK)
+            amap[NAV_BACK] = 'nav_back'
+        tail.append(NAV_HOME)
+        amap[NAV_HOME] = 'back_to_main'
+        rows.append(tail)
+    with NAV_LOCK:
+        _nav_forget_old()
+        st = NAV_STATE.get(chat_id) or _nav_blank()
+        st.update({'map': amap, 'rows': rows, 'time': time.time(), 'await': False})
+        st['seq'] += 1
+        NAV_STATE[chat_id] = st
+    return _nav_rows_to_markup(rows)
+
+
+def _nav_cancel_menu(chat_id):
+    """Small keyboard shown while the bot waits for typed text or a file."""
+    rows = [[NAV_CANCEL, NAV_HOME]]
+    with NAV_LOCK:
+        st = NAV_STATE.get(chat_id) or _nav_blank()
+        st.update({'map': {NAV_CANCEL: 'nav_cancel', NAV_HOME: 'back_to_main'}, 'rows': rows,
+                   'time': time.time(), 'await': True})
+        st['seq'] += 1
+        NAV_STATE[chat_id] = st
+    return _nav_rows_to_markup(rows)
+
+
+def _nav_convert_markup(chat_id, menu):
+    if isinstance(menu, NavMenu):
+        if chat_id is None:
+            return None
+        return _nav_build(chat_id, menu)
+    return menu
+
+
+# --- fake "call" so the existing callback code runs unchanged ----------------------
+class _NavMessage:
+    def __init__(self, chat, user, text):
+        self.chat = chat
+        self.from_user = user
+        self.message_id = -next(_NAV_CALL_COUNTER)     # negative: not a real Telegram message
+        self.text = text
+        self.reply_to_message = None
+        self.content_type = 'text'
+        self.date = int(time.time())
+
+
+class _NavCall:
+    def __init__(self, message, action):
+        self.id = f"nav:{message.chat.id}:{next(_NAV_CALL_COUNTER)}"
+        self.from_user = message.from_user
+        self.data = action
+        self.message = _NavMessage(message.chat, message.from_user, message.text)
+        self.inline_message_id = None
+        self.game_short_name = None
+
+
+def _nav_run(message, action):
+    """Run a callback action as if its button had been pressed (used by commands and keys)."""
+    handle_callbacks(_NavCall(message, action))
+
+
+_NAV_VIEW_PREFIXES = (
+    'check_files', 'file_', 'user_account', 'my_running', 'user_help', 'admin_dashboard', 'admin_panel',
+    'user_management', 'admin_settings', 'hosting_health', 'subscription', 'stats', 'manual_install',
+    'adm_approvals', 'rv_v', 'rv_o', 'manage_mandatory_channels', 'all_users', 'list_admins', 'system_info',
+    'bot_performance', 'database_backup', 'speed')
+
+
+def _nav_lookup(st, text):
+    if st is None:
+        return None
+    action = st['map'].get(text)
+    if action is None:
+        norm = re.sub(r'\d+', '#', text)
+        hits = [a for lab, a in st['map'].items() if re.sub(r'\d+', '#', lab) == norm and not re.match(r'^\W*\d+\.', lab)]
+        if len(hits) == 1 and '#' in norm:
+            action = hits[0]                      # a live label such as "Approvals (3)" that changed number
+    return action
+
+
+def _nav_is_label(message):
+    try:
+        if message.chat.type != 'private' or not message.text or message.text.startswith('/'):
+            return False
+        if message.text in NAV_RESERVED:
+            return True
+        return _nav_lookup(_nav_get(message.chat.id), message.text) is not None
+    except Exception:
+        return False
+
+
+def _nav_show_main(message, note=None):
+    uid = message.from_user.id
+    if note:
+        bot.send_message(message.chat.id, note, reply_markup=create_main_menu_inline(uid))
+    else:
+        _nav_run(message, 'back_to_main')
+
+
+def _nav_dispatch(message):
+    chat_id = message.chat.id
+    text = message.text
+    with NAV_LOCK:
+        st = _nav_get(chat_id)
+    if text == NAV_CANCEL:
+        with NAV_LOCK:
+            if st:
+                st['await'] = False
+        _nav_clear_input(message)
+        _nav_show_main(message, "❎ Cancel ho gaya.")
+        return
+    if text in (NAV_HOME,) and _nav_lookup(st, text) is None:
+        _nav_show_main(message)
+        return
+    action = _nav_lookup(st, text)
+    if text == NAV_BACK and action is None:
+        action = 'nav_back'
+    if action is None:
+        _nav_stale(message)
+        return
+    if action == 'nav_cancel':
+        _nav_clear_input(message)
+        _nav_show_main(message, "❎ Cancel ho gaya.")
+        return
+    if action.startswith('url:'):
+        bot.send_message(chat_id, action[4:], disable_web_page_preview=False)
+        return
+    with NAV_LOCK:
+        st = NAV_STATE.get(chat_id)
+        if action == 'nav_back':
+            action = st['stack'].pop() if st and st['stack'] else 'back_to_main'
+            if st:
+                st['cur'] = None
+        elif st is not None:
+            if action == 'back_to_main':
+                st['stack'] = []
+                st['cur'] = None
+            elif action.startswith(_NAV_VIEW_PREFIXES):
+                if st['cur'] and st['cur'] != action:
+                    st['stack'].append(st['cur'])
+                    del st['stack'][:-NAV_BACK_STACK_MAX]
+                st['cur'] = action
+    _nav_run(message, action)
+
+
+def _nav_clear_input(message):
+    """Forget a half-finished typed input (Cancel pressed)."""
+    try:
+        bot.clear_step_handler_by_chat_id(message.chat.id)
+    except Exception:
+        pass
+    try:
+        _discard_wait(message.from_user.id)
+    except Exception:
+        pass
+    try:
+        _gh_cancel_user(message.from_user.id)
+    except Exception:
+        pass
+
+
+def _nav_stale(message):
+    """Text that matches no key of the current keyboard: put the keyboard back."""
+    chat_id = message.chat.id
+    st = _nav_get(chat_id)
+    note = "Ye option ab available nahi hai. Neeche ke buttons se chuno 👇"
+    if st and st.get('rows'):
+        bot.send_message(chat_id, note, reply_markup=_nav_rows_to_markup(st['rows']))
+    else:
+        bot.send_message(chat_id, note, reply_markup=create_main_menu_inline(message.from_user.id))
+
+
+def _nav_wrap_next_step(callback):
+    """A typed answer normally goes to the waiting step; a key label, Cancel or a /command re-routes."""
+    def wrapped(message, *a, **kw):
+        text = getattr(message, 'text', None)
+        chat_id = message.chat.id
+        if text:
+            st = _nav_get(chat_id)
+            if text == NAV_CANCEL or text == NAV_HOME or text.startswith('/') or _nav_lookup(st, text) is not None:
+                try:
+                    bot.clear_step_handler_by_chat_id(chat_id)
+                except Exception:
+                    pass
+                if text.startswith('/'):
+                    bot.process_new_messages([message])
+                else:
+                    _nav_dispatch(message)
+                return
+        before = (_nav_get(chat_id) or {}).get('seq', 0)
+        result = callback(message, *a, **kw)
+        st = _nav_get(chat_id)
+        if st is None or st.get('seq', 0) == before or st.get('await'):
+            try:
+                bot.send_message(chat_id, "🏠 Menu", reply_markup=create_main_menu_inline(message.from_user.id))
+            except Exception:
+                logger.exception("Could not restore the menu keyboard")
+        return result
+    return wrapped
+
+
+def _nav_offer_cancel(message):
+    """Called when a typed answer is awaited: make sure a Cancel key is on screen."""
+    chat_id = message.chat.id
+    st = _nav_get(chat_id)
+    if st and any('cancel' in lab.lower() for lab in st['map']) and not st.get('await'):
+        return
+    bot.send_message(chat_id, "✍️ Apna jawab bhejo. Rukna ho to ❌ Cancel dabao.", reply_markup=_nav_cancel_menu(chat_id))
+
+
+def _nav_convert_call(args, kwargs, chat_id):
+    kwargs = dict(kwargs)
+    args = list(args)
+    for i, v in enumerate(args):
+        if isinstance(v, NavMenu):
+            args[i] = _nav_convert_markup(chat_id, v)
+    if isinstance(kwargs.get('reply_markup'), NavMenu):
+        kwargs['reply_markup'] = _nav_convert_markup(chat_id, kwargs['reply_markup'])
+        if kwargs['reply_markup'] is None:
+            kwargs.pop('reply_markup')
+    rp = kwargs.get('reply_parameters')
+    if rp is not None and (getattr(rp, 'message_id', 1) or 1) < 0:
+        kwargs.pop('reply_parameters')
+    if isinstance(kwargs.get('reply_to_message_id'), int) and kwargs['reply_to_message_id'] < 0:
+        kwargs.pop('reply_to_message_id')
+    return tuple(args), kwargs
+
+
 class SafeTeleBot(telebot.TeleBot):
     """TeleBot whose common calls survive the usual harmless Telegram errors:
     rate limits (429) are waited out, 'message is not modified' is ignored, broken
@@ -275,34 +656,98 @@ class SafeTeleBot(telebot.TeleBot):
                 time.sleep(2 * (attempt + 1))
         return None
 
+    def _nav_args(self, args, kwargs, chat_pos=0):
+        chat_id = kwargs.get('chat_id', args[chat_pos] if len(args) > chat_pos else None)
+        return _nav_convert_call(args, kwargs, chat_id)
+
     def send_message(self, *args, **kwargs):
+        args, kwargs = self._nav_args(args, kwargs)
         return self._guard(super().send_message, args, kwargs, 'send_message')
 
     def edit_message_text(self, *args, **kwargs):
+        text = kwargs.get('text', args[0] if args else '')
+        chat_id = kwargs.get('chat_id', args[1] if len(args) > 1 else None)
+        message_id = kwargs.get('message_id', args[2] if len(args) > 2 else None)
+        menu = kwargs.get('reply_markup')
+        virtual = isinstance(message_id, int) and message_id < 0
+        if isinstance(menu, NavMenu) or (virtual and chat_id is not None):
+            # A reply keyboard cannot be attached by editing, so the screen is sent as a new message
+            # and the old one is removed when it is a real message.
+            send_kwargs = {k: kwargs[k] for k in ('parse_mode', 'entities', 'disable_web_page_preview') if k in kwargs}
+            if menu is not None:
+                send_kwargs['reply_markup'] = menu
+            sent = self.send_message(chat_id, text, **send_kwargs)
+            if isinstance(menu, NavMenu) and isinstance(message_id, int) and message_id > 0:
+                try:
+                    self.delete_message(chat_id, message_id)
+                except Exception:
+                    pass
+            return sent
         return self._guard(super().edit_message_text, args, kwargs, 'edit_message_text')
 
+    def edit_message_reply_markup(self, *args, **kwargs):
+        chat_id = kwargs.get('chat_id', args[0] if args else None)
+        menu = kwargs.get('reply_markup')
+        if isinstance(menu, NavMenu):
+            if chat_id is None:
+                return None
+            return self.send_message(chat_id, "🔄 Menu update ho gaya.", reply_markup=menu)
+        message_id = kwargs.get('message_id', args[1] if len(args) > 1 else None)
+        if isinstance(message_id, int) and message_id < 0:
+            return None
+        try:
+            return self._guard(super().edit_message_reply_markup, args, kwargs, 'edit_message_reply_markup')
+        except Exception as exc:
+            logger.warning("edit_message_reply_markup skipped: %s", redact_secrets(exc))
+            return None
+
     def answer_callback_query(self, *args, **kwargs):
+        qid = kwargs.get('callback_query_id', args[0] if args else '')
+        if isinstance(qid, str) and qid.startswith('nav:'):
+            text = kwargs.get('text', args[1] if len(args) > 1 else None)
+            if text:
+                try:
+                    self.send_message(int(qid.split(':')[1]), text)
+                except Exception:
+                    logger.warning("Could not send the notice for a key press")
+            return True
         return self._guard(super().answer_callback_query, args, kwargs, 'answer_callback_query')
 
     def delete_message(self, *args, **kwargs):
+        message_id = kwargs.get('message_id', args[1] if len(args) > 1 else None)
+        if isinstance(message_id, int) and message_id < 0:
+            return True
         return self._guard(super().delete_message, args, kwargs, 'delete_message')
 
+    def register_next_step_handler(self, message, callback, *args, **kwargs):
+        try:
+            _nav_offer_cancel(message)
+        except Exception:
+            logger.exception("Could not show the Cancel key")
+        return super().register_next_step_handler(message, _nav_wrap_next_step(callback), *args, **kwargs)
+
     def send_document(self, *args, **kwargs):
+        args, kwargs = self._nav_args(args, kwargs)
         return self._guard(super().send_document, args, kwargs, 'send_document')
 
     def send_photo(self, *args, **kwargs):
+        args, kwargs = self._nav_args(args, kwargs)
         return self._guard(super().send_photo, args, kwargs, 'send_photo')
 
     def send_video(self, *args, **kwargs):
+        args, kwargs = self._nav_args(args, kwargs)
         return self._guard(super().send_video, args, kwargs, 'send_video')
 
     def send_audio(self, *args, **kwargs):
+        args, kwargs = self._nav_args(args, kwargs)
         return self._guard(super().send_audio, args, kwargs, 'send_audio')
 
     def send_voice(self, *args, **kwargs):
+        args, kwargs = self._nav_args(args, kwargs)
         return self._guard(super().send_voice, args, kwargs, 'send_voice')
 
     def send_sticker(self, *args, **kwargs):
+        args, kwargs = self._nav_args(args, kwargs)
         return self._guard(super().send_sticker, args, kwargs, 'send_sticker')
 
 
@@ -505,864 +950,227 @@ except Exception:
     sys.exit(1)
 load_data()
 
-# --- Security Functions ---
-def _code_security_reasons(content, file_type):
-    """Conservative review checks; normal bot APIs, regex, files and HTTP are allowed."""
-    reasons = []
-    destructive_patterns = [
-        (r'(?i)\brm\s+-rf\s+/(?:\s|$)', 'recursive deletion of filesystem root'),
-        (r'(?i)\bmkfs(?:\.[a-z0-9]+)?\b', 'filesystem formatting command'),
-        (r'(?i)\bdd\s+if=.*\bof=/dev/(?:sd|nvme|vd)', 'raw disk overwrite command'),
-        (r'(?i)\b(?:shutdown|poweroff|reboot)\b', 'host shutdown command'),
-        (r'(?i)\bchmod\s+-R\s+777\b', 'recursive world-writable permissions'),
-    ]
-    for pattern, label in destructive_patterns:
-        if re.search(pattern, content):
-            reasons.append(label)
-
-    if file_type == 'py':
-        try:
-            tree = ast.parse(content)
-        except SyntaxError:
-            # Syntax errors are reported by the runner; don't falsely label them unsafe.
-            tree = None
-        if tree is not None:
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                parts = []
-                current = node.func
-                while isinstance(current, ast.Attribute):
-                    parts.append(current.attr)
-                    current = current.value
-                if isinstance(current, ast.Name):
-                    parts.append(current.id)
-                dotted = '.'.join(reversed(parts))
-                if dotted in {'os.system', 'os.popen', 'subprocess.Popen', 'subprocess.run',
-                              'subprocess.call', 'subprocess.check_output', 'shutil.rmtree',
-                              'eval', 'exec', 'compile', '__import__'}:
-                    reasons.append(f'powerful operation: {dotted}')
-                    if len(reasons) >= 8:
-                        break
-    elif file_type == 'js':
-        js_patterns = [
-            (r'(?i)\bchild_process\s*\.\s*(?:exec|execSync|spawn|spawnSync)\s*\(', 'Node child-process execution'),
-            (r'(?i)\beval\s*\(', 'dynamic eval execution'),
-            (r'(?i)\bfs\s*\.\s*(?:rmSync|rmdirSync)\s*\(', 'recursive filesystem deletion'),
-        ]
-        for pattern, label in js_patterns:
-            if re.search(pattern, content):
-                reasons.append(label)
-    return list(dict.fromkeys(reasons))
-
-
-def check_code_security(file_path, file_type):
-    """Flag high-impact operations for admin review without blocking normal bot code."""
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as handle:
-            content = handle.read()
-        reasons = _code_security_reasons(content, file_type)
-        if reasons:
-            logger.warning('Code requires review: %s: %s', file_path, reasons)
-            return False, 'Potentially powerful operations require admin review: ' + ', '.join(reasons[:5])
-        return True, 'No high-impact patterns detected (not a security sandbox)'
-    except Exception as exc:
-        logger.exception('Code review scan failed for %s', file_path)
-        return False, f'Security check error: {exc}'
-
-
-def scan_zip_security(zip_path):
-    """Inspect source files in ZIP archives for high-impact operations."""
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as archive:
-            for item in archive.infolist():
-                if item.is_dir():
-                    continue
-                ext = os.path.splitext(item.filename)[1].lower()
-                if ext not in ('.py', '.js'):
-                    continue
-                if item.file_size > 2 * 1024 * 1024:
-                    return False, f'Source file too large to inspect: {item.filename}'
-                content = archive.read(item).decode('utf-8', errors='ignore')
-                reasons = _code_security_reasons(content, 'py' if ext == '.py' else 'js')
-                if reasons:
-                    return False, f'{item.filename} requires admin review: {", ".join(reasons[:5])}'
-        return True, 'No high-impact patterns detected (not a security sandbox)'
-    except Exception as exc:
-        return False, f'Error scanning archive: {exc}'
-
 # =============================================================================
-# Upload Security Scanner (static analysis only - uploaded code is NEVER run here)
+# Upload scanner: simple, static, honest.
 # =============================================================================
-# How it works, in three auditable layers:
-#   1. DETECTORS  (_PyDetector / _js_detect / _text_rules) turn source code into FINDINGS:
-#                 (rule_id, line, detail).  Detectors never decide a verdict.
-#   2. SCAN_RULES one table: points, minimum level ("floor"), per-rule cap and the plain-language
-#                 sentence shown to people.  Add or tune a rule by editing ONE row.
-#   3. score_findings()  pure function: findings -> {level, score, reasons}.
-#                 level = the higher of (score thresholds, rule floors).
-# To add a detector: append a finding with a rule id from SCAN_RULES. To add a rule: add a row.
-# This is a screening step, not a sandbox: it catches the common dangerous patterns and
-# deliberately sends anything it cannot understand to a human admin.
+# This only READS the code (it never runs it). It is a quick screening step, NOT a sandbox and
+# NOT an antivirus: a determined person can still hide things from it.
+#   LOW    -> starts automatically
+#   MEDIUM -> held until an admin approves or rejects it
+#   HIGH   -> rejected (clearly harmful: miner, reverse shell, wiping disks, stealing server
+#             secrets, touching this hosting platform's own data, decoding hidden code and running it)
+# Ordinary bot code (requests, sockets, subprocess, os.system, files, regex, env vars) is LOW.
+# If the scanner itself fails or cannot read a file, the result is LOW and a line is logged.
 
-SCANNER_VERSION = 2
+SCANNER_VERSION = 3
 THREAT_LOW, THREAT_MEDIUM, THREAT_HIGH = 'low', 'medium', 'high'
 THREAT_RANK = {THREAT_LOW: 0, THREAT_MEDIUM: 1, THREAT_HIGH: 2}
 THREAT_BADGE = {THREAT_LOW: '🟢', THREAT_MEDIUM: '🟡', THREAT_HIGH: '🔴'}
 THREAT_NAME = {THREAT_LOW: 'LOW', THREAT_MEDIUM: 'MEDIUM', THREAT_HIGH: 'HIGH'}
-SCAN_MEDIUM_SCORE = 30   # total points that make a file MEDIUM
-SCAN_HIGH_SCORE = 80     # total points that make a file HIGH
-SCAN_MAX_SOURCE_BYTES = 2 * 1024 * 1024   # a single source file bigger than this is not auto-inspected
+SCAN_MAX_SOURCE_BYTES = 4 * 1024 * 1024
 SCAN_MAX_ZIP_READ_BYTES = 40 * 1024 * 1024
-M, H = THREAT_MEDIUM, THREAT_HIGH
-
-# rule id -> (points per hit, minimum level or None, max points from this rule, plain-language text)
-SCAN_RULES = {
-    'remote_code':    (100, H, 100, 'It downloads or decodes hidden code and then runs it'),
-    'dyn_exec':       (30, M, 60, 'It runs code that is built while the bot is running (eval / exec / compile / __import__)'),
-    'evasion':        (80, H, 80, 'It builds the names of dangerous functions piece by piece to hide them'),
-    'dyn_access':     (30, M, 30, 'It reaches system functions in a hidden, indirect way'),
-    'os_command':     (30, M, 60, 'It runs system commands (os.system / os.popen / os.exec)'),
-    'subprocess':     (30, M, 60, 'It starts other programs on the server (subprocess)'),
-    'rm_tree':        (15, None, 30, 'It can delete whole folders (shutil.rmtree)'),
-    'file_delete':    (5, None, 15, 'It deletes files (os.remove / os.unlink)'),
-    'raw_socket':     (30, M, 30, 'It opens raw network sockets'),
-    'reverse_shell':  (100, H, 100, 'It looks like a reverse shell (gives someone remote control of the server)'),
-    'host_files':     (40, M, 40, 'It touches the hosting bot\'s own files, database or other users\' folders'),
-    'secret_files':   (50, M, 50, 'It reads secret or system files (passwords, keys, cloud credentials, process memory)'),
-    'other_bots_env': (40, M, 40, 'It looks for other bots\' .env / settings files'),
-    'env_broad':      (30, M, 30, 'It reads ALL environment variables, not just its own settings'),
-    'steal_exfil':    (100, H, 100, 'It collects secrets (tokens / environment / key files) and sends them out'),
-    'self_replicate': (100, H, 100, 'It copies its own code into other places (self-replicating)'),
-    'blocked_cfg':    (10, None, 30, 'It uses a function the hosting rules restrict'),
-    'obfuscated':     (25, M, 25, 'The code is scrambled / obfuscated, so it cannot be checked'),
-    'detach':         (35, M, 35, 'It tries to keep running outside the hosting control (background / detached process)'),
-    'write_outside':  (30, M, 30, 'It writes or changes files outside its own folder'),
-    'path_traversal': (20, None, 20, 'It uses ../ paths that can leave its own folder'),
-    'persistence':    (90, H, 90, 'It tries to install itself permanently on the server (cron, startup files, ssh keys)'),
-    'destructive':    (100, H, 100, 'It contains a destructive command (wipe disk / delete everything)'),
-    'host_power':     (100, H, 100, 'It can shut down or reboot the whole server'),
-    'miner':          (100, H, 100, 'It looks like a crypto-miner'),
-    'container_escape': (100, H, 100, 'It tries to break out of the hosting container / read other processes'),
-    'priv_esc':       (50, M, 50, 'It tries to gain admin (root) powers or change server security'),
-    'kill_procs':     (35, M, 35, 'It can kill other programs running on the server'),
-    'low_level':      (30, M, 30, 'It uses low-level or remote-control tools (ctypes, ssh, keyboard / screen capture)'),
-    'suspicious_net': (15, None, 30, 'It talks to suspicious addresses (raw IPs, tunnels, paste / webhook sites)'),
-    'open_port':      (10, None, 10, 'It opens a network port on the server'),
-    'chmod_exec':     (35, M, 35, 'It makes files executable'),
-    'download_exec':  (100, H, 100, 'It downloads a program, makes it executable and runs it'),
-    'marshal':        (40, M, 40, 'It loads pre-compiled code (marshal), which cannot be read or checked'),
-    'binary':         (40, M, 40, 'The file is not readable text (binary / compiled content)'),
-    'too_big':        (30, M, 30, 'The source file is too large to be checked automatically'),
-    'bundled_libs':   (30, M, 30, 'It contains bundled libraries / environments that cannot be checked'),
-    'compiled_file':  (40, M, 40, 'It contains compiled / executable files'),
-    'install_risk':   (40, M, 40, 'Its install list pulls code from unusual places or runs install scripts'),
-    'shell_script':   (15, None, 15, 'It includes shell scripts'),
-    'unreadable':     (30, M, 30, 'It could not be read properly for checking'),
-}
-
-# --- shared text patterns (applied to string constants in Python, or the whole text in JS / broken Python)
 _RX = re.compile
-_MINER_RX = _RX(r'(?i)xmrig|minerd|cpuminer|ethminer|nicehash|stratum\+(?:tcp|ssl)|cryptonight|supportxmr|nanopool|hashvault|randomx|coinhive')
-_SECRET_FILE_RX = _RX(r'(?i)/etc/(?:shadow|sudoers|gshadow)|\.ssh/|\bid_(?:rsa|ed25519|ecdsa|dsa)\b|\.aws/credentials|\.git-credentials|\.netrc\b|\.docker/config|\.kube/config|\.bash_history|/proc/(?:self|\d+|\*)/(?:environ|mem|maps|cmdline)|169\.254\.169\.254|metadata\.google\.internal|(?:^|[\s\'"=])/root/')
-_ESCAPE_RX = _RX(r'(?i)docker\.sock|\bnsenter\b|release_agent|/proc/1/|notify_on_release')
-_REVSHELL_RX = _RX(r'(?i)/dev/tcp/|\bbash\s+-i\b|\bsh\s+-i\b|\bnc(?:at)?\s+(?:-\w*[ec]\b|[^\n]{0,40}\s-e\b)|\bsocat\b[^\n]*exec|\bmkfifo\b[^\n]*\bnc\b|0<&\d+|pty\.spawn')
-_PERSIST_RX = _RX(r'(?i)\bcrontab\s+-|/etc/cron|/var/spool/cron|systemctl\s+(?:enable|start|daemon-reload)|/etc/systemd|\.bashrc\b|\.bash_profile\b|\.zshrc\b|rc\.local|authorized_keys|/etc/init\.d|ld\.so\.preload|\bLD_PRELOAD\b')
-_DLEXEC_RX = _RX(r'(?i)\b(?:curl|wget)\b[^|;\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b')
-_CHMODX_RX = _RX(r'(?i)\bchmod\s+(?:-\w+\s+)?(?:\+x|u\+x|a\+x|[0-7]?[0-7][0-7][157])\b')
-_SUSP_NET_RX = _RX(r'(?i)https?://(?!127\.|0\.0\.0\.0|localhost|10\.|192\.168\.)\d{1,3}(?:\.\d{1,3}){3}|\.onion\b|ngrok|serveo\.net|localtunnel|loca\.lt|trycloudflare|pastebin\.com/raw|hastebin|transfer\.sh|anonfiles|file\.io/|webhook\.site|requestbin|pipedream\.net|interact\.sh|burpcollaborator|grabify|iplogger|discord(?:app)?\.com/api/webhooks')
-_HOST_BASE_RX = _RX(r'(?i)bot_data\.db|\bupload_bots\b|demon_hosting')
-# command-context patterns (only trusted when the code also runs shell commands)
-_DESTRUCT_RX = _RX(r'(?i)\brm\s+-[a-z]*r[a-z]*\s+(?:--no-preserve-root\s+)?(?:/|~|\$HOME|\*)(?:\s|\*|$)|\bmkfs(?:\.\w+)?\b|\bdd\s+if=\S+\s+of=/dev/|:\(\)\s*\{\s*:\s*\|\s*:\s*&|\bchmod\s+-R\s+777\b|>\s*/dev/(?:sd|nvme|vd)')
-_POWER_RX = _RX(r'(?i)(?<![\w.])(?:shutdown|poweroff|reboot|halt)(?![\w.])|\binit\s+0\b')
-_KILL_RX = _RX(r'(?i)\b(?:pkill|killall)\b|\bkill\s+-(?:9|KILL)\b')
-_PRIV_RX = _RX(r'(?i)(?<![\w.])sudo\b|\bsu\s+(?:-|root)|\bsetuid\b|\bchown\s+root|\biptables\b|\bip6tables\b|\bufw\s|\buseradd\b|\badduser\b|\busermod\b|\bpasswd\s')
-_DETACH_RX = _RX(r'(?i)\bnohup\b|\bsetsid\b|\bdisown\b|&\s*$')
 
-_SAFE_WRITE_PREFIXES = ('/tmp/', '/var/tmp/', '/dev/null')
-_NET_FETCH = {'requests.get', 'requests.post', 'requests.put', 'requests.patch', 'requests.request', 'requests.head',
-              'requests.delete', 'urllib.request.urlopen', 'urllib.request.urlretrieve', 'urllib.request.Request',
-              'urlopen', 'urlretrieve', 'httpx.get', 'httpx.post', 'httpx.request', 'urllib3.request', 'wget.download',
-              'http.client.HTTPConnection', 'http.client.HTTPSConnection', 'aiohttp.ClientSession'}
-_NET_SEND_METHODS = {'post', 'put', 'patch', 'request', 'send', 'sendall', 'sendto', 'sendmail', 'send_message',
-                     'storbinary', 'storlines'}
-_NET_SEND_FULL = {'requests.post', 'requests.put', 'requests.patch', 'requests.request', 'httpx.post', 'httpx.request',
-                  'urllib.request.urlopen', 'urlopen', 'urllib.request.Request', 'urllib3.request'}
-_DECODE_CALLS = {'base64.b64decode', 'base64.b32decode', 'base64.b16decode', 'base64.a85decode', 'base64.b85decode',
-                 'base64.urlsafe_b64decode', 'base64.decodebytes', 'b64decode', 'binascii.unhexlify', 'binascii.a2b_base64',
-                 'bytes.fromhex', 'zlib.decompress', 'gzip.decompress', 'bz2.decompress', 'lzma.decompress', 'codecs.decode',
-                 'marshal.loads'}
-_SPAWN_FULL = {'os.system', 'os.popen', 'os.posix_spawn', 'os.posix_spawnp', 'pty.spawn', 'commands.getoutput',
-               'asyncio.create_subprocess_exec', 'asyncio.create_subprocess_shell'}
-_LOW_LEVEL_MODULES = {'ctypes', 'paramiko', 'pexpect', 'pty', 'telnetlib', 'fabric', 'scapy', 'pynput', 'keyboard',
-                      'pyautogui', 'pyperclip', 'mss', 'win32api', 'pywinauto', 'cffi'}
-_COVERED_CALLS = {'eval', 'exec', 'compile', '__import__', 'os.system', 'os.popen', 'os.remove', 'os.unlink', 'shutil.rmtree'}
-_ENV_NARROW_ATTRS = {'get', 'setdefault', 'pop', 'update', '__contains__', '__getitem__', '__setitem__', 'clear'}
-_READ_ONLY_HELPERS = {'open', 'Path', 'pathlib.Path', 'io.open', 'codecs.open', 'os.open'}
+# (level, text shown to people, regex run on text that is NOT a comment)
+_SCAN_TEXT_RULES = [
+    (THREAT_HIGH, 'Looks like a crypto miner',
+     _RX(r'(?i)xmrig|minerd\b|cpuminer|ethminer|nicehash|stratum\+(?:tcp|ssl)|cryptonight|supportxmr|nanopool|hashvault|coinhive')),
+    (THREAT_HIGH, 'Opens a reverse shell',
+     _RX(r'(?i)/dev/tcp/|\bbash\s+-i\s*>&|\bnc(?:at)?\s+(?:-\w*e\b|[^\n]{0,40}\s-e\s)|\bsocat\b[^\n]*exec:|\bmkfifo\b[^\n]*\bnc\b|pty\.spawn')),
+    (THREAT_HIGH, 'Tries to wipe or damage the server',
+     _RX(r'(?i)\brm\s+-[a-z]*r[a-z]*\s+(?:--no-preserve-root\s+)?(?:/|~|\$HOME)(?:\s|\*|$|["\'])|\bmkfs(?:\.\w+)?\b|\bdd\s+if=\S+\s+of=/dev/|:\(\)\s*\{\s*:\s*\|\s*:\s*&|>\s*/dev/(?:sd|nvme|vd)|\bchmod\s+-R\s+777\s+/(?:\s|$)')),
+    (THREAT_HIGH, 'Reads server secrets (passwords, keys, cloud credentials)',
+     _RX(r'(?i)/etc/(?:shadow|gshadow|sudoers)|\.ssh/|\bid_(?:rsa|ed25519|ecdsa)\b|\.aws/credentials|\.git-credentials|\.docker/config|\.kube/config|/proc/(?:self|\d+)/(?:environ|mem)|169\.254\.169\.254|metadata\.google\.internal|docker\.sock')),
+    (THREAT_HIGH, 'Downloads a script and pipes it into a shell',
+     _RX(r'(?i)\b(?:curl|wget)\b[^|;\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b')),
+    (THREAT_HIGH, "Touches this hosting platform's own data or other users' folders",
+     _RX(r'(?i)bot_data\.db|\bupload_bots\b|demon_hosting')),
+    (THREAT_MEDIUM, 'Uses admin / system-level commands (sudo, crontab, service, firewall, kill-all)',
+     _RX(r'(?i)(?<![\w.])sudo\s|\bcrontab\s+-|/etc/cron|systemctl\s+(?:enable|start|stop|daemon-reload)|/etc/systemd|\bpkill\b|\bkillall\b|\biptables\b|\bufw\s|\buseradd\b|\badduser\b|\bpasswd\s|(?<![\w.])(?:shutdown|poweroff|reboot)\s+(?:-|now)|authorized_keys|ld\.so\.preload')),
+    (THREAT_MEDIUM, 'Sets itself up to survive restarts (shell profile / startup scripts)',
+     _RX(r'(?i)\.bashrc\b|\.bash_profile\b|\.zshrc\b|/etc/rc\.local|/etc/init\.d')),
+    (THREAT_MEDIUM, 'Sends data to tunnel / log-catcher services',
+     _RX(r'(?i)\.onion\b|ngrok\.|serveo\.net|localtunnel|loca\.lt|trycloudflare|webhook\.site|requestbin|pipedream\.net|interact\.sh|grabify|iplogger|discord(?:app)?\.com/api/webhooks')),
+]
+_SYSPATH_TEXT = 'Touches system folders (/etc, /usr, /bin, /root)'
+_SYSPATH_RX = _RX(r'(?<![\w.~/-])/(?:etc|usr|bin|sbin|root|boot)/[\w./*-]+')
+_SYSPATH_OK = _RX(r'^/(?:etc/(?:os-release|hostname|localtime|timezone|resolv\.conf|ssl/|ca-certificates|mime\.types|lsb-release)'
+                  r'|usr/(?:share/|lib/python|local/bin/(?:env|python[\d.]*|node|npm|pip[\d.]*)$|bin/(?:env|python[\d.]*|node|npm|pip[\d.]*|which)$)'
+                  r'|bin/(?:sh|bash|env|ls|cat|echo|python[\d.]*)$)')
 
 
-def _shannon_entropy(text):
-    if not text:
-        return 0.0
-    counts = {}
-    for ch in text:
-        counts[ch] = counts.get(ch, 0) + 1
-    total = float(len(text))
-    return -sum((n / total) * math.log(n / total, 2) for n in counts.values())
+def _system_path_hit(text):
+    for match in _SYSPATH_RX.finditer(text):
+        if not _SYSPATH_OK.match(match.group(0)):
+            return match
+    return None
+
+
+_JS_HIGH_RX = _RX(r'(?i)(?:\beval\s*\(|new\s+Function\s*\()[^;]{0,200}?(?:atob\s*\(|Buffer\.from\([^)]*[\'"]base64[\'"]|\bfetch\s*\(|https?\.get\s*\(|axios\.get\s*\()')
+_JS_HIGH_TEXT = 'Decodes or downloads hidden code and runs it'
+_DECODE_NAMES = ('b64decode', 'b32decode', 'b16decode', 'a85decode', 'b85decode', 'decompress', 'fromhex', 'unhexlify', 'marshal.loads',
+                 'codecs.decode', 'requests.get', 'requests.post', 'urlopen', 'httpx.get', 'urllib.request.urlopen')
+_COMMAND_CALL_ENDS = ('os.system', 'os.popen', 'subprocess.run', 'subprocess.call', 'subprocess.check_call',
+                      'subprocess.check_output', 'subprocess.Popen', 'subprocess.getoutput', 'subprocess.getstatusoutput',
+                      'Popen', 'getoutput')
+_PY_COMMAND_RULES = [r for r in _SCAN_TEXT_RULES if r[0] == THREAT_MEDIUM and r[1].startswith('Uses admin')]
+
+
+def _scan_finding(level, text, line=None):
+    return {'id': text[:24], 'text': text, 'points': 100 if level == THREAT_HIGH else 40, 'floor': level,
+            'lines': [line] if line else [], 'details': []}
 
 
 def _line_of(text, pos):
     return text.count('\n', 0, pos) + 1
 
 
-def _host_markers():
-    """Absolute paths that identify THIS hosting bot's own data (looked up when scanning)."""
-    markers = []
-    for value in (BASE_DIR, UPLOAD_BOTS_DIR, IROTECH_DIR, DATABASE_PATH, os.path.abspath(__file__)):
-        value = str(value or '')
-        if len(value) > 8:
-            markers.append(value)
-    return markers
+def _dotted(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return '.'.join(reversed(parts))
 
 
-def _string_rule_findings(text, line, in_command_context, findings):
-    """Apply the text patterns to ONE string (or a whole file). Appends (rule, line, detail)."""
-    if not text or len(text) < 3:
-        return
-    low = text.lower()
-    if _MINER_RX.search(text):
-        findings.append(('miner', line, 'mining keyword'))
-    if _REVSHELL_RX.search(text):
-        findings.append(('reverse_shell', line, 'reverse shell text'))
-    if _ESCAPE_RX.search(text):
-        findings.append(('container_escape', line, 'container / process access'))
-    if _SECRET_FILE_RX.search(text):
-        findings.append(('secret_files', line, _SECRET_FILE_RX.search(text).group(0).strip(' \'"=')[:40]))
-    if _PERSIST_RX.search(text):
-        findings.append(('persistence', line, _PERSIST_RX.search(text).group(0)[:40]))
-    if _DLEXEC_RX.search(text):
-        findings.append(('download_exec', line, 'pipe download into shell'))
-    if _SUSP_NET_RX.search(text):
-        findings.append(('suspicious_net', line, _SUSP_NET_RX.search(text).group(0)[:50]))
-    if _HOST_BASE_RX.search(text) or any(marker in text for marker in _host_markers()):
-        findings.append(('host_files', line, 'hosting folder / database'))
-    if '.env' in low and ('upload_bots' in low or '../' in low or '*' in text):
-        findings.append(('other_bots_env', line, '.env of other folders'))
-    if in_command_context:
-        if _DESTRUCT_RX.search(text):
-            findings.append(('destructive', line, _DESTRUCT_RX.search(text).group(0)[:40]))
-        if _POWER_RX.search(text):
-            findings.append(('host_power', line, 'shutdown / reboot'))
-        if _KILL_RX.search(text):
-            findings.append(('kill_procs', line, 'pkill / killall'))
-        if _PRIV_RX.search(text):
-            findings.append(('priv_esc', line, 'sudo / security tools'))
-        if _DETACH_RX.search(text):
-            findings.append(('detach', line, 'nohup / setsid / background'))
-        if _CHMODX_RX.search(text):
-            findings.append(('chmod_exec', line, 'chmod +x'))
-
-
-class _PyDetector:
-    """Walks a Python syntax tree and reports findings. Never executes anything."""
-
-    def __init__(self, tree, source, depth=0):
-        self.tree, self.source, self.depth = tree, source, depth
-        self.findings = []
-        self.aliases = {}
-        self.parent = {}
-        self.var_tags = {}
-        self.caps = set()
-        self.str_env = {}
-        self.strings = []   # (line, text)
-        self.nodes = list(ast.walk(tree))
-        for node in self.nodes:
-            for child in ast.iter_child_nodes(node):
-                self.parent[child] = node
-
-    # ---- name / string helpers
-    def _collect_aliases(self):
-        for node in self.nodes:
-            if isinstance(node, ast.Import):
-                for item in node.names:
-                    self.aliases[item.asname or item.name.split('.')[0]] = item.name if item.asname else item.name.split('.')[0]
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                for item in node.names:
-                    self.aliases[item.asname or item.name] = f'{node.module}.{item.name}'
-
-    def dotted(self, node):
-        parts = []
-        while isinstance(node, ast.Attribute):
-            parts.append(node.attr)
-            node = node.value
-        if isinstance(node, ast.Name):
-            parts.append(self.aliases.get(node.id, node.id))
-        elif isinstance(node, ast.Call):
-            inner = self.dotted(node.func)
-            if inner:
-                parts.append(inner)
-            else:
-                return ''
-        else:
-            return ''
-        return '.'.join(reversed(parts))
-
-    def fold(self, node, depth=0):
-        """Best-effort constant string for an expression (None if it is not constant)."""
-        if depth > 6 or node is None:
-            return None
-        if isinstance(node, ast.Constant):
-            if isinstance(node.value, str):
-                return node.value
-            if isinstance(node.value, bytes):
-                return node.value.decode('utf-8', 'ignore')
-            return None
-        if isinstance(node, ast.Name):
-            return self.str_env.get(node.id)
-        if isinstance(node, ast.JoinedStr):
-            out = []
-            for part in node.values:
-                if isinstance(part, ast.Constant):
-                    out.append(str(part.value))
-                else:
-                    out.append('{}')
-            return ''.join(out)
-        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
-            left, right = self.fold(node.left, depth + 1), self.fold(node.right, depth + 1)
-            if left is not None and right is not None:
-                return left + right
-            if left is not None and isinstance(node.op, ast.Mod):
-                return left
-            return None
-        if isinstance(node, ast.Call):
-            name = self.dotted(node.func)
-            if isinstance(node.func, ast.Attribute) and node.func.attr == 'join' and node.args:
-                sep = self.fold(node.func.value, depth + 1)
-                seq = node.args[0]
-                if sep is not None and isinstance(seq, (ast.List, ast.Tuple)):
-                    items = [self.fold(item, depth + 1) for item in seq.elts]
-                    if all(item is not None for item in items):
-                        return sep.join(items)
-                return None
-            if name == 'chr' and len(node.args) == 1 and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, int):
-                try:
-                    return chr(node.args[0].value)
-                except (ValueError, OverflowError):
-                    return None
-            decoded = self._decode_constant(node, name, depth)
-            if decoded is not None:
-                return decoded
-            if isinstance(node.func, ast.Attribute) and node.func.attr in ('decode', 'strip', 'lower', 'upper', 'format'):
-                return self.fold(node.func.value, depth + 1)
-        return None
-
-    def _decode_constant(self, node, name, depth):
-        """Decode base64 / hex / zlib / rot13 payloads that are written as constants."""
-        if not node.args:
-            return None
-        leaf = name.rsplit('.', 1)[-1]
-        if leaf not in ('b64decode', 'urlsafe_b64decode', 'b32decode', 'b16decode', 'a85decode', 'b85decode', 'decodebytes',
-                        'unhexlify', 'a2b_base64', 'fromhex', 'decompress', 'decode'):
-            return None
-        inner = node.args[0]
-        raw = self._raw_bytes(inner, depth + 1)
-        if raw is None:
-            return None
-        try:
-            if leaf in ('b64decode', 'urlsafe_b64decode', 'decodebytes', 'a2b_base64'):
-                data = base64.b64decode(raw + b'=' * (-len(raw) % 4), validate=False)
-            elif leaf == 'b32decode':
-                data = base64.b32decode(raw)
-            elif leaf == 'b16decode':
-                data = base64.b16decode(raw)
-            elif leaf == 'a85decode':
-                data = base64.a85decode(raw)
-            elif leaf == 'b85decode':
-                data = base64.b85decode(raw)
-            elif leaf in ('unhexlify', 'fromhex'):
-                data = bytes.fromhex(raw.decode('ascii', 'ignore'))
-            elif leaf == 'decompress':
-                data = zlib.decompress(raw)
-            else:
-                return None
-            return data[:200000].decode('utf-8', 'ignore')
-        except Exception:
-            return None
-
-    def _raw_bytes(self, node, depth):
-        if depth > 6:
-            return None
-        text = self.fold(node, depth)
-        if text is not None:
-            return text.encode('utf-8', 'ignore')
-        if isinstance(node, ast.Call):
-            name = self.dotted(node.func)
-            leaf = name.rsplit('.', 1)[-1]
-            if leaf in ('b64decode', 'decompress', 'unhexlify', 'fromhex') and node.args:
-                inner = self._decode_constant(node, name, depth + 1)
-                if inner is not None:
-                    return inner.encode('utf-8', 'ignore')
-            if isinstance(node.func, ast.Attribute) and node.func.attr in ('encode',):
-                return self._raw_bytes(node.func.value, depth + 1)
-        return None
-
-    # ---- environment access
-    def _is_environ(self, node):
-        return self.dotted(node) in ('os.environ', 'os.environb')
-
-    def _environ_is_broad(self, node):
-        parent = self.parent.get(node)
-        if isinstance(parent, ast.Subscript) and parent.value is node:
-            return False   # os.environ['KEY'] reads one setting
-        if isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in _ENV_NARROW_ATTRS:
-            return False
-        if isinstance(parent, ast.Compare) and node in parent.comparators and any(isinstance(op, (ast.In, ast.NotIn)) for op in parent.ops):
-            return False
-        if isinstance(parent, ast.keyword) and parent.arg == 'env':
-            return False
-        return True
-
-    # ---- tags: what kind of data flows into an expression (simple, flow-insensitive)
-    def tags(self, node):
-        found = set()
-        if node is None:
-            return found
-        for sub in ast.walk(node):
-            if isinstance(sub, ast.Name):
-                found |= self.var_tags.get(sub.id, set())
-            elif isinstance(sub, ast.Call):
-                name = self.dotted(sub.func)
-                if name in _NET_FETCH or (name.endswith(('.get', '.post')) and name.split('.')[0] in ('requests', 'httpx', 'session', 'aiohttp')):
-                    found.add('net')
-                if name in _DECODE_CALLS or name.rsplit('.', 1)[-1] in ('b64decode', 'unhexlify'):
-                    found.add('decode')
-                if name in _READ_ONLY_HELPERS and sub.args:
-                    text = self.fold(sub.args[0]) or ''
-                    if text and (_SECRET_FILE_RX.search(text) or _HOST_BASE_RX.search(text) or any(m in text for m in _host_markers())):
-                        found.add('secret')
-            elif isinstance(sub, (ast.Attribute, ast.Subscript, ast.Name)):
-                target = sub.value if isinstance(sub, ast.Subscript) else sub
-                if isinstance(target, (ast.Attribute, ast.Name)) and self._is_environ(target) and self._environ_is_broad(target):
-                    found.add('env')
-        return found
-
-    def _compute_var_tags(self):
-        for node in self.nodes:
-            if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Constant, ast.JoinedStr, ast.BinOp)):
-                text = self.fold(node.value)
-                if text is not None:
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            self.str_env[target.id] = text
-        for _ in range(3):
-            for node in self.nodes:
-                pairs = []
-                if isinstance(node, ast.Assign):
-                    pairs = [(t, node.value) for t in node.targets]
-                elif isinstance(node, (ast.AugAssign, ast.AnnAssign)) and getattr(node, 'value', None) is not None:
-                    pairs = [(node.target, node.value)]
-                elif isinstance(node, ast.NamedExpr):
-                    pairs = [(node.target, node.value)]
-                elif isinstance(node, (ast.For, ast.AsyncFor)):
-                    pairs = [(node.target, node.iter)]
-                elif isinstance(node, (ast.With, ast.AsyncWith)):
-                    pairs = [(item.optional_vars, item.context_expr) for item in node.items if item.optional_vars is not None]
-                for target, value in pairs:
-                    value_tags = self.tags(value)
-                    if not value_tags:
-                        continue
-                    for sub in ast.walk(target):
-                        if isinstance(sub, ast.Name):
-                            self.var_tags.setdefault(sub.id, set()).update(value_tags)
-
-    # ---- the detection pass
-    def run(self):
-        self._collect_aliases()
-        self._compute_var_tags()
-        docstrings = set()
-        for node in self.nodes:
-            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body:
-                first = node.body[0]
-                if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
-                    docstrings.add(id(first.value))
-        imported = set(self.aliases.values()) | {value.split('.')[0] for value in self.aliases.values()}
-        for module in sorted(_LOW_LEVEL_MODULES & imported):
-            self.findings.append(('low_level', 1, f'imports {module}'))
-        for node in self.nodes:
-            line = getattr(node, 'lineno', 0)
-            if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and id(node) not in docstrings:
-                text = node.value if isinstance(node.value, str) else node.value.decode('utf-8', 'ignore')
-                self.strings.append((line, text))
-                if len(text) >= 200 and ' ' not in text.strip() and _shannon_entropy(text) > 4.6:
-                    self.findings.append(('obfuscated', line, 'long encoded string'))
-            elif isinstance(node, (ast.JoinedStr, ast.BinOp)) or (isinstance(node, ast.Call) and (
-                    (isinstance(node.func, ast.Attribute) and node.func.attr in ('join', 'decode', 'format'))
-                    or self.dotted(node.func).rsplit('.', 1)[-1] in ('b64decode', 'unhexlify', 'fromhex', 'decompress', 'a85decode', 'b85decode'))):
-                text = self.fold(node)
-                if text and len(text) >= 3:
-                    self.strings.append((line, text))
-            if isinstance(node, (ast.Attribute, ast.Name)) and self._is_environ(node) and self._environ_is_broad(node):
-                self.findings.append(('env_broad', line, 'os.environ read as a whole'))
-                self.caps.add('env_broad')
-            if isinstance(node, ast.Name) and node.id in ('__builtins__',) or (isinstance(node, ast.Attribute) and node.attr in ('__builtins__', '__globals__', '__subclasses__', '__bases__')):
-                self.findings.append(('dyn_access', line, 'builtins / globals access'))
-            if isinstance(node, ast.Call):
-                self._call(node, line)
-        # string-based rules
-        command_ctx = bool({'cmd'} & self.caps)
-        seen = set()
-        for line, text in self.strings:
-            key = (line, text[:80])
-            if key in seen:
-                continue
-            seen.add(key)
-            _string_rule_findings(text, line, command_ctx, self.findings)
-            if len(text) >= 40 and self.depth < 2 and (text.lstrip().startswith(('import ', 'from ', 'def ', 'exec', 'eval', '__import__', 'os.', 'subprocess')) or '\n' in text):
-                inner = _scan_python_text(text, self.depth + 1)
-                if inner:
-                    self.findings.extend((rid, line, 'hidden code: ' + detail) for rid, _l, detail in inner)
-        # traversal
-        for line, text in self.strings:
-            if '../' in text.replace('\\', '/') and len(text) < 300:
-                self.findings.append(('path_traversal', line, 'uses ../'))
-                break
-        # combos that need the whole-file view
-        if 'selfsrc' in self.caps and 'write' in self.caps and ('walk' in self.caps or any(f[0] == 'host_files' for f in self.findings)):
-            self.findings.append(('self_replicate', 1, 'reads its own file and writes copies'))
-        if 'net_write' in self.caps and 'chmod_exec' in self.caps and 'cmd' in self.caps:
-            self.findings.append(('download_exec', 1, 'downloads, makes executable, runs'))
-        if 'walk' in self.caps and any(re.search(r'^\.env$|/\.env$|\*\.env', text) for _l, text in self.strings):
-            self.findings.append(('other_bots_env', 1, 'walks folders looking for .env'))
-        if 'process_iter' in self.caps and 'kill' in self.caps:
-            self.findings.append(('kill_procs', 1, 'walks all processes and kills them'))
-        return self.findings
-
-    def _call(self, node, line):
-        name = self.dotted(node.func)
-        leaf = name.rsplit('.', 1)[-1]
-        args_tags = set()
-        for arg in list(node.args) + [kw.value for kw in node.keywords]:
-            args_tags |= self.tags(arg)
-        first = node.args[0] if node.args else None
-        first_const = self.fold(first) if first is not None else None
-
-        if name in ('eval', 'exec', 'compile', '__import__', 'builtins.eval', 'builtins.exec', 'builtins.compile'):
-            if args_tags & {'net', 'decode'}:
-                self.findings.append(('remote_code', line, f'{leaf}() on downloaded / decoded data'))
-            elif first is not None and first_const is None:
-                self.findings.append(('dyn_exec', line, f'{leaf}() with a runtime value'))
-                if any(isinstance(sub, ast.Call) and self.dotted(sub.func) in ('chr', 'bytes', 'bytearray') for sub in ast.walk(first)):
-                    self.findings.append(('evasion', line, 'code assembled from character codes'))
-        if name == 'getattr' and node.args and self.dotted(node.args[0]) in ('os', 'subprocess', 'builtins', 'sys', 'ctypes', 'importlib'):
-            self.findings.append(('dyn_access', line, 'getattr on a system module'))
-            hidden = self.fold(node.args[1]) if len(node.args) > 1 else None
-            if hidden and not isinstance(node.args[1], ast.Constant) and re.search(r'system|popen|exec|spawn|Popen|eval|compile|import', hidden):
-                self.findings.append(('evasion', line, f'builds the name "{hidden[:20]}"'))
-        if name in ('importlib.import_module',) and first is not None and first_const is None:
-            self.findings.append(('dyn_exec', line, 'import of a runtime-chosen module'))
-        if name in ('marshal.loads', 'marshal.load'):
-            self.findings.append(('marshal', line, 'marshal'))
-        if name == 'os.system' or name == 'os.popen' or name.startswith(('os.exec', 'os.spawn')) or name in _SPAWN_FULL:
-            self.findings.append(('os_command', line, name))
-            self.caps.add('cmd')
-        if name.startswith('subprocess.') or name in ('Popen', 'check_output', 'check_call') and self.aliases.get(leaf, '').startswith('subprocess'):
-            self.findings.append(('subprocess', line, name))
-            self.caps.add('cmd')
-            for kw in node.keywords:
-                if kw.arg in ('start_new_session', 'preexec_fn', 'creationflags'):
-                    self.findings.append(('detach', line, f'{kw.arg} in subprocess'))
-        if name in ('os.fork', 'os.setsid', 'os.setpgrp', 'os.daemon', 'os.forkpty', 'daemon.DaemonContext'):
-            self.findings.append(('detach', line, name))
-        if name in ('os.setuid', 'os.seteuid', 'os.setgid', 'os.chroot', 'os.setresuid'):
-            self.findings.append(('priv_esc', line, name))
-        if name == 'shutil.rmtree':
-            self.findings.append(('rm_tree', line, name))
-        if name in ('os.remove', 'os.unlink', 'os.rmdir', 'os.removedirs'):
-            self.findings.append(('file_delete', line, name))
-        if name in ('socket.socket', 'socket.create_connection', 'socket.fromfd', 'ssl.wrap_socket') or name.startswith('socketserver.'):
-            self.findings.append(('raw_socket', line, name))
-            self.caps.add('socket')
-        if name in ('os.dup2',) and 'socket' in self.caps:
-            self.findings.append(('reverse_shell', line, 'socket redirected into a shell'))
-        if leaf in ('bind', 'listen') and 'socket' in self.caps:
-            self.findings.append(('open_port', line, 'listens on a port'))
-        if name in ('os.walk', 'glob.glob', 'glob.iglob', 'os.scandir') or leaf in ('rglob', 'iterdir'):
-            self.caps.add('walk')
-        if name in ('psutil.process_iter',):
-            self.caps.add('process_iter')
-        if leaf in ('kill', 'terminate') and name != 'os.kill':
-            self.caps.add('kill')
-        if name in ('os.chmod', 'os.fchmod'):
-            mode = node.args[1] if len(node.args) > 1 else None
-            if isinstance(mode, ast.Constant) and isinstance(mode.value, int) and mode.value & 0o111:
-                self.findings.append(('chmod_exec', line, 'chmod with execute bit'))
-                self.caps.add('chmod_exec')
-            elif mode is not None and not isinstance(mode, ast.Constant):
-                self.findings.append(('chmod_exec', line, 'chmod with a computed mode'))
-                self.caps.add('chmod_exec')
-        # file writes outside the user's folder
-        write_target = None
-        if name in ('open', 'io.open', 'codecs.open') and first is not None:
-            mode_node = node.args[1] if len(node.args) > 1 else next((kw.value for kw in node.keywords if kw.arg == 'mode'), None)
-            mode_text = self.fold(mode_node) or ''
-            if any(flag in mode_text for flag in 'wax+'):
-                write_target = first_const
-                self.caps.add('write')
-        if name in ('shutil.copy', 'shutil.copy2', 'shutil.copyfile', 'shutil.copytree', 'shutil.move', 'os.rename', 'os.replace',
-                    'os.symlink', 'os.link') and len(node.args) > 1:
-            write_target = self.fold(node.args[1])
-            self.caps.add('write')
-        if name in ('os.makedirs', 'os.mkdir', 'os.chown', 'os.truncate') and first_const:
-            write_target = first_const
-        if leaf in ('write_text', 'write_bytes', 'touch', 'mkdir') and isinstance(node.func, ast.Attribute):
-            self.caps.add('write')
-            base = node.func.value
-            if isinstance(base, ast.Call) and self.dotted(base.func) in ('Path', 'pathlib.Path') and base.args:
-                write_target = self.fold(base.args[0])
-        if write_target is not None:
-            norm = write_target.replace('\\', '/')
-            if (norm.startswith('/') and not norm.startswith(_SAFE_WRITE_PREFIXES)) or norm.startswith('~') or '../' in norm:
-                self.findings.append(('write_outside', line, norm[:60]))
-        if leaf in ('write', 'write_bytes', 'write_text', 'copyfileobj') and 'net' in args_tags:
-            self.caps.add('net_write')
-        # self-replication source
-        for arg in node.args[:1]:
-            if isinstance(arg, ast.Name) and arg.id == '__file__' or (isinstance(arg, ast.Subscript) and self.dotted(arg.value) == 'sys.argv'):
-                if name in ('open', 'shutil.copy', 'shutil.copy2', 'shutil.copyfile', 'Path', 'pathlib.Path') or leaf in ('read_text', 'read_bytes'):
-                    self.caps.add('selfsrc')
-        if name == 'inspect.getsource' or name == 'inspect.getsourcefile':
-            self.caps.add('selfsrc')
-        # exfiltration: secrets going into a network send
-        sends = name in _NET_SEND_FULL or (leaf in _NET_SEND_METHODS and leaf not in ('send_message',) and name.split('.')[0] in ('requests', 'httpx', 'session', 'socket', 'sock', 's', 'conn', 'smtplib', 'ftplib', 'client'))
-        if name in ('smtplib.SMTP', ) or leaf in ('sendmail', 'storbinary'):
-            sends = True
-        if sends and args_tags & {'env', 'secret'}:
-            self.findings.append(('steal_exfil', line, f'{leaf}() sends secrets'))
-        if name in ('requests.get', 'httpx.get', 'urllib.request.urlopen', 'urlopen') and args_tags & {'env', 'secret'}:
-            self.findings.append(('steal_exfil', line, 'secrets placed in a web address'))
-        # blocked list from SECURITY_CONFIG (generic, so editing the config extends the scanner)
-        for entry in _security_config_entries():
-            if name == entry or name.startswith(entry + '.'):
-                if name not in _COVERED_CALLS and not name.startswith('subprocess'):
-                    self.findings.append(('blocked_cfg', line, name))
-
-
-def _security_config_entries():
-    """Dotted names from SECURITY_CONFIG. Bare 'os' / 'zipfile' are ignored: nearly every bot imports them."""
-    entries = []
-    for key in ('blocked_modules', 'blocked_imports'):
-        for entry in SECURITY_CONFIG.get(key, []):
-            if '.' in entry and entry not in entries:
-                entries.append(entry)
-    return entries
-
-
-def _scan_python_text(source, depth=0):
+def _py_strings_and_calls(source):
+    """Returns (string constants as (text, line), findings from call analysis) or None when the code does not parse."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return None
-    try:
-        return _PyDetector(tree, source, depth).run()
-    except RecursionError:
-        return [('obfuscated', 1, 'code is nested too deeply to analyse')]
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, 'body', None)
+            if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], 'value', None), ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                docstrings.add(id(body[0].value))
+    strings, found = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+            strings.append((node.value, getattr(node, 'lineno', 1)))
+        elif isinstance(node, ast.Call):
+            name = _dotted(node.func)
+            if name in ('exec', 'eval') or name.endswith(('.exec', '.eval')):
+                inner = [_dotted(sub.func) for sub in ast.walk(node) if isinstance(sub, ast.Call) and sub is not node]
+                if any(item.endswith(_DECODE_NAMES) for item in inner):
+                    found.append(_scan_finding(THREAT_HIGH, 'Decodes or downloads hidden code and runs it', node.lineno))
+            elif name.endswith(_COMMAND_CALL_ENDS):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                        for level, text, rx in _PY_COMMAND_RULES:
+                            if rx.search(sub.value):
+                                found.append(_scan_finding(level, text, node.lineno))
+            elif name in ('shutil.rmtree', 'rmtree') and node.args and isinstance(node.args[0], ast.Constant) \
+                    and node.args[0].value in ('/', '~', '/home', '/root', '/etc', '/usr', '/var'):
+                found.append(_scan_finding(THREAT_HIGH, 'Tries to wipe or damage the server', node.lineno))
+    return strings, found
 
 
-_JS_RULES = [
-    ('subprocess', _RX(r'''(?:require\(\s*['"](?:node:)?child_process['"]\s*\)|from\s+['"](?:node:)?child_process['"])'''), 'child_process'),
-    ('dyn_exec', _RX(r'\beval\s*\(|\bnew\s+Function\s*\(|\bvm\.(?:runIn\w*|Script)\b|\brequire\(\s*[\'"]vm[\'"]\s*\)'), 'eval / Function / vm'),
-    ('raw_socket', _RX(r'''require\(\s*['"](?:node:)?(?:net|dgram|tls)['"]\s*\)|from\s+['"](?:node:)?(?:net|dgram|tls)['"]'''), 'net / dgram / tls'),
-    ('detach', _RX(r'detached\s*:\s*true|\.unref\s*\('), 'detached process'),
-    ('low_level', _RX(r'''require\(\s*['"](?:ffi-napi|node-ffi|ref-napi|ssh2|node-pty|robotjs|iohook|keylogger)['"]|process\.(?:binding|dlopen)\b'''), 'native / remote tools'),
-    ('write_outside', _RX(r'''fs(?:\.promises)?\.(?:write|append|create|copy|rename|mkdir|chmod|symlink)\w*\(\s*[`'"](?:/(?!tmp/)|\.\./|~)'''), 'fs write outside'),
-    ('rm_tree', _RX(r'\bfs\.(?:rmSync|rmdirSync|rm|rmdir)\s*\([^)]*recursive'), 'recursive delete'),
-    ('obfuscated', _RX(r'eval\(function\(p,a,c,k,e|(?:_0x[0-9a-f]{3,}[^\n]{0,80}){6}'), 'packed / obfuscated'),
-    ('marshal', _RX(r'process\.mainModule\.require'), 'hidden require'),
-]
-_JS_ENV_DUMP = _RX(r'Object\.(?:keys|entries|values|assign)\s*\(\s*process\.env|JSON\.stringify\s*\(\s*process\.env|\.\.\.\s*process\.env|\bprocess\.env\s*[,)]')
-_JS_NET_SEND = _RX(r'axios\.(?:post|put|patch)|\bfetch\s*\(|https?\.request|XMLHttpRequest|webhook|\.post\s*\(')
-_JS_REMOTE = _RX(r'''atob\(|Buffer\.from\([^)]*['"]base64['"]|\bfetch\(|https?\.get\(|axios\.get\(''')
-_JS_SELFCOPY = _RX(r'(?:readFileSync|copyFileSync|copyFile)\s*\(\s*(?:__filename|process\.argv\[1\])')
+def _strip_comments(text, file_type):
+    if file_type == 'js':
+        text = re.sub(r'/\*.*?\*/', lambda m: '\n' * m.group(0).count('\n'), text, flags=re.S)
+        return re.sub(r'(?m)(^|[^:\'"\\])//[^\n]*', r'\1', text)
+    return re.sub(r'(?m)^\s*#[^\n]*', '', text)
 
 
-def _js_detect(text):
-    findings = []
-    for rule_id, rx, detail in _JS_RULES:
-        for match in rx.finditer(text):
-            line = _line_of(text, match.start())
-            if rule_id == 'dyn_exec':
-                window = text[max(0, match.start() - 400):match.end() + 400]
-                if _JS_REMOTE.search(window):
-                    findings.append(('remote_code', line, 'eval on downloaded / decoded data'))
-                    continue
-            findings.append((rule_id, line, detail))
-            break
-    for match in _JS_ENV_DUMP.finditer(text):
-        line = _line_of(text, match.start())
-        findings.append(('env_broad', line, 'process.env as a whole'))
-        if _JS_NET_SEND.search(text[max(0, match.start() - 500):match.end() + 500]):
-            findings.append(('steal_exfil', line, 'environment sent over the network'))
-        break
-    for match in re.finditer(r'process\.env\b(?!\s*[.\[])', text):
-        before = text[max(0, match.start() - 8):match.start()].rstrip()
-        if before.endswith('} ='):
-            continue
-        if re.match(r'\s*[;)\n]', text[match.end():match.end() + 3]) and re.search(r'(?:=|\()\s*$', before):
-            findings.append(('env_broad', _line_of(text, match.start()), 'process.env as a whole'))
-            break
-    if _JS_SELFCOPY.search(text) and re.search(r'writeFile\w*\(|copyFile\w*\(', text) and re.search(r'readdir|walk|glob', text):
-        findings.append(('self_replicate', 1, 'copies its own file'))
-    if re.search(r'child_process', text):
-        for rx, rid in ((_DESTRUCT_RX, 'destructive'), (_POWER_RX, 'host_power'), (_KILL_RX, 'kill_procs'), (_PRIV_RX, 'priv_esc')):
-            match = rx.search(text)
-            if match:
-                findings.append((rid, _line_of(text, match.start()), match.group(0)[:40]))
-    _string_rule_findings(text, 1, False, findings)
-    return findings
-
-
-def _text_obfuscation_findings(text):
-    """Whole-file heuristics: long unreadable lines, escape floods, scrambled names."""
-    findings = []
-    lines = text.split('\n')
-    long_lines = [index for index, value in enumerate(lines, 1) if len(value) > 2000]
-    if long_lines:
-        findings.append(('obfuscated', long_lines[0], 'extremely long line'))
-    elif len(text) > 400000 and lines and len(text) / max(1, len(lines)) > 600:
-        findings.append(('obfuscated', 1, 'dense unreadable code'))
-    if len(re.findall(r'\\x[0-9a-fA-F]{2}', text)) > 300 or len(re.findall(r'_0x[0-9a-f]{4,}', text)) > 40:
-        findings.append(('obfuscated', 1, 'escape-code flood'))
-    if len(re.findall(r'\bchr\(\s*\d+\s*\)', text)) > 60:
-        findings.append(('obfuscated', 1, 'text built from character codes'))
-    return findings
-
-
-def score_findings(findings):
-    """PURE scoring: findings [(rule_id, line, detail)] -> {'level','score','reasons'}.
-    Each rule adds its points per distinct hit (capped); the level is the higher of the
-    score thresholds and any rule floor. Nothing else decides the verdict."""
-    by_rule = {}
-    for rule_id, line, detail in findings:
-        if rule_id not in SCAN_RULES:
-            continue
-        entry = by_rule.setdefault(rule_id, {'lines': [], 'details': []})
-        if line not in entry['lines']:
-            entry['lines'].append(line)
-        if detail and detail not in entry['details']:
-            entry['details'].append(detail)
-    total = 0
-    floor = THREAT_LOW
-    reasons = []
-    for rule_id, entry in by_rule.items():
-        points, rule_floor, cap, text = SCAN_RULES[rule_id]
-        earned = min(cap, points * max(1, len(entry['lines'])))
-        total += earned
-        if rule_floor and THREAT_RANK[rule_floor] > THREAT_RANK[floor]:
-            floor = rule_floor
-        reasons.append({'id': rule_id, 'text': text, 'points': earned, 'floor': rule_floor or THREAT_LOW,
-                        'lines': sorted(x for x in entry['lines'] if x)[:4], 'details': entry['details'][:3]})
-    level = THREAT_LOW
-    if total >= SCAN_HIGH_SCORE:
-        level = THREAT_HIGH
-    elif total >= SCAN_MEDIUM_SCORE:
-        level = THREAT_MEDIUM
-    if THREAT_RANK[floor] > THREAT_RANK[level]:
-        level = floor
-    reasons.sort(key=lambda item: (-THREAT_RANK[item['floor']], -item['points']))
-    return {'level': level, 'score': total, 'reasons': reasons}
+def _host_path_findings(text):
+    """Mentioning the hosting folder's real path is also a platform-data access."""
+    base = str(BASE_DIR or '')
+    if len(base) > 8 and base in text:
+        return [_scan_finding(THREAT_HIGH, "Touches this hosting platform's own data or other users' folders")]
+    return []
 
 
 def scan_source(content, file_type, filename=''):
-    """Scan one source file's TEXT. file_type is 'py' or 'js'. Returns the scan result dict."""
+    """Scan one source file's text. file_type is 'py' or 'js'. Returns the result dict."""
     findings = []
     try:
         if file_type == 'py':
-            py_findings = _scan_python_text(content)
-            if py_findings is None:
-                # Broken Python is still scanned as plain text so a typo cannot hide a payload.
-                py_findings = []
-                _string_rule_findings(content, 1, True, py_findings)
-                for rx, rid, label in ((_RX(r'\bos\.(?:system|popen)\s*\('), 'os_command', 'os.system'),
-                                       (_RX(r'\bsubprocess\.\w+\s*\('), 'subprocess', 'subprocess'),
-                                       (_RX(r'\b(?:eval|exec)\s*\('), 'dyn_exec', 'eval / exec'),
-                                       (_RX(r'\bsocket\.socket\s*\('), 'raw_socket', 'socket')):
-                    match = rx.search(content)
-                    if match:
-                        py_findings.append((rid, _line_of(content, match.start()), label))
-            findings.extend(py_findings)
+            parsed = _py_strings_and_calls(content)
+            if parsed is None:
+                logger.info('Scan: %s does not parse as Python, checking it as plain text only', filename)
+                chunks = [(_strip_comments(content, 'py'), 1)]
+            else:
+                strings, calls = parsed
+                findings.extend(calls)
+                chunks = strings
+            for chunk, line in chunks:
+                for level, text, rx in _SCAN_TEXT_RULES:
+                    if level == THREAT_HIGH and rx.search(chunk):
+                        findings.append(_scan_finding(level, text, line if parsed is not None else None))
+                    elif level == THREAT_MEDIUM and not text.startswith('Uses admin') and rx.search(chunk):
+                        findings.append(_scan_finding(level, text, line if parsed is not None else None))
+                if _system_path_hit(chunk):
+                    findings.append(_scan_finding(THREAT_MEDIUM, _SYSPATH_TEXT, line if parsed is not None else None))
+            if parsed is None:
+                for level, text, rx in _SCAN_TEXT_RULES:
+                    if text.startswith('Uses admin') and rx.search(chunks[0][0]):
+                        findings.append(_scan_finding(level, text))
         else:
-            findings.extend(_js_detect(content))
-        findings.extend(_text_obfuscation_findings(content))
-    except Exception as exc:   # a scanner failure must never mean "safe"
-        logger.warning('Scanner could not fully analyse %s: %s', filename, exc)
-        findings.append(('unreadable', 1, 'scanner error'))
-    result = score_findings(findings)
-    result.update({'file': filename, 'type': file_type, 'size': len(content), 'scanner': SCANNER_VERSION})
-    return result
+            clean = _strip_comments(content, 'js')
+            for level, text, rx in _SCAN_TEXT_RULES:
+                match = rx.search(clean)
+                if match:
+                    findings.append(_scan_finding(level, text, _line_of(clean, match.start())))
+            hit = _system_path_hit(clean)
+            if hit:
+                findings.append(_scan_finding(THREAT_MEDIUM, _SYSPATH_TEXT, _line_of(clean, hit.start())))
+            match = _JS_HIGH_RX.search(clean)
+            if match:
+                findings.append(_scan_finding(THREAT_HIGH, _JS_HIGH_TEXT, _line_of(clean, match.start())))
+        findings.extend(_host_path_findings(content))
+    except Exception as exc:   # a scanner failure is LOW (by design) but is always logged
+        logger.warning('Scanner could not analyse %s (treated as LOW): %s', filename, exc)
+        findings = []
+    return _build_result(findings, filename, file_type, len(content))
+
+
+def _build_result(findings, filename, file_type, size):
+    seen, reasons = set(), []
+    for item in sorted(findings, key=lambda f: (-THREAT_RANK[f['floor']], f['lines'] or [0])):
+        if item['text'] in seen:
+            continue
+        seen.add(item['text'])
+        reasons.append(item)
+    level = THREAT_LOW
+    for item in reasons:
+        if THREAT_RANK[item['floor']] > THREAT_RANK[level]:
+            level = item['floor']
+    score = min(100, sum(item['points'] for item in reasons))
+    return {'level': level, 'score': score, 'reasons': reasons, 'file': filename, 'type': file_type, 'size': size,
+            'scanner': SCANNER_VERSION}
 
 
 def scan_bytes(data, file_type, filename=''):
-    """Scan raw uploaded bytes (what we receive from Telegram). Binary content is MEDIUM."""
+    """Scan raw uploaded bytes. Unreadable / binary / oversized content is LOW (logged), as agreed."""
     digest = hashlib.sha256(data).hexdigest()
-    if len(data) > SCAN_MAX_SOURCE_BYTES:
-        result = score_findings([('too_big', 1, f'{len(data) // 1024} KB')])
-    elif b'\x00' in data[:8192]:
-        result = score_findings([('binary', 1, 'contains NUL bytes')])
-    else:
-        try:
-            text = data.decode('utf-8')
-        except UnicodeDecodeError:
-            bad = len(data.decode('utf-8', 'ignore')) / max(1, len(data))
-            text = data.decode('utf-8', 'ignore')
-            if bad < 0.8:
-                result = score_findings([('binary', 1, 'not valid text')])
-                result.update({'file': filename, 'type': file_type, 'size': len(data), 'scanner': SCANNER_VERSION, 'sha256': digest})
-                return result
-        result = scan_source(text, file_type, filename)
+    try:
+        if len(data) > SCAN_MAX_SOURCE_BYTES:
+            logger.info('Scan: %s is too big to inspect (%s KB), treated as LOW', filename, len(data) // 1024)
+            result = _build_result([], filename, file_type, len(data))
+        elif b'\x00' in data[:8192]:
+            logger.info('Scan: %s looks binary, treated as LOW', filename)
+            result = _build_result([], filename, file_type, len(data))
+        else:
+            result = scan_source(data.decode('utf-8', 'ignore'), file_type, filename)
+    except Exception as exc:
+        logger.warning('Scan error on %s (treated as LOW): %s', filename, exc)
+        result = _build_result([], filename, file_type, len(data))
     result.update({'file': filename, 'type': file_type, 'size': len(data), 'scanner': SCANNER_VERSION, 'sha256': digest})
     return result
 
 
-def scan_requirements_text(text, filename='requirements.txt'):
-    findings = []
-    for number, raw in enumerate(text.splitlines(), 1):
-        line = raw.split('#', 1)[0].strip()
-        if not line:
-            continue
-        low = line.lower()
-        if low.startswith(('git+', '-e', '--index-url', '--extra-index-url', '-i ', '--find-links', '-f ', '--trusted-host', '--no-index')) \
-                or '://' in low or low.startswith(('-r ../', '-c ../', '--requirement ..', '/')) or ' @ ' in low:
-            findings.append(('install_risk', number, line[:50]))
-    return findings
-
-
-def scan_package_json_text(text):
-    findings = []
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return [('install_risk', 1, 'package.json is not valid')]
-    scripts = data.get('scripts') or {}
-    for hook in ('preinstall', 'install', 'postinstall', 'prepare', 'prepublish'):
-        if hook in scripts:
-            findings.append(('install_risk', 1, f'{hook} script'))
-    for section in ('dependencies', 'devDependencies', 'optionalDependencies'):
-        for pkg, spec in (data.get(section) or {}).items():
-            spec = str(spec).lower()
-            if spec.startswith(('git', 'http', 'file:', 'github:', 'link:')) or '://' in spec:
-                findings.append(('install_risk', 1, f'{pkg} from {spec[:30]}'))
-    return findings
-
-
-_COMPILED_EXTS = ('.so', '.pyd', '.dll', '.dylib', '.exe', '.node', '.bin', '.elf', '.pyc', '.pyo', '.jar', '.apk', '.msi', '.com', '.scr')
+_COMPILED_EXTS = ('.so', '.pyd', '.dll', '.dylib', '.exe', '.node', '.elf', '.msi', '.scr')
 _VENDOR_DIRS = ('node_modules/', 'site-packages/', 'venv/', '.venv/', 'env/lib/', '__pycache__/')
 
 
 def scan_zip_file(zip_path):
-    """Scan every member of a ZIP without extracting it to disk. Returns a combined result."""
-    members = []   # (name, result)
-    extra = []
-    bundled = compiled = shell = False
+    """Scan the source files inside a ZIP without extracting it. Returns one combined result."""
+    findings, scanned = [], 0
     read_total = 0
     try:
         with zipfile.ZipFile(zip_path, 'r') as archive:
@@ -1372,80 +1180,54 @@ def scan_zip_file(zip_path):
                 name = item.filename.replace('\\', '/')
                 low = name.lower()
                 if any(('/' + low).find('/' + vendor) != -1 for vendor in _VENDOR_DIRS):
-                    bundled = True
                     continue
                 if low.endswith(_COMPILED_EXTS):
-                    compiled = True
+                    findings.append(_scan_finding(THREAT_MEDIUM, f'Contains a compiled program ({os.path.basename(low)})'))
                     continue
-                if low.endswith(('.sh', '.bash')):
-                    shell = True
                 ext = os.path.splitext(low)[1]
-                base = os.path.basename(low)
-                if ext not in ('.py', '.js') and base not in ('requirements.txt', 'package.json') and ext not in ('.sh', '.bash'):
+                if ext not in ('.py', '.js', '.sh', '.bash'):
                     continue
                 if item.file_size > SCAN_MAX_SOURCE_BYTES:
-                    members.append((name, score_findings([('too_big', 1, f'{item.file_size // 1024} KB')])))
+                    logger.info('Scan: %s in archive too big, skipped', name)
                     continue
                 read_total += item.file_size
                 if read_total > SCAN_MAX_ZIP_READ_BYTES:
-                    extra.append(('too_big', 1, 'archive source is very large'))
+                    logger.info('Scan: archive source is very large, rest skipped')
                     break
                 data = archive.read(item)
-                if base == 'requirements.txt':
-                    members.append((name, score_findings(scan_requirements_text(data.decode('utf-8', 'ignore'), name))))
-                elif base == 'package.json':
-                    members.append((name, score_findings(scan_package_json_text(data.decode('utf-8', 'ignore')))))
-                elif ext in ('.sh', '.bash'):
-                    shell_findings = []
-                    _string_rule_findings(data.decode('utf-8', 'ignore'), 1, True, shell_findings)
-                    members.append((name, score_findings(shell_findings)))
+                kind = 'js' if ext == '.js' else 'py'
+                if ext in ('.sh', '.bash'):
+                    sub = scan_source(_strip_comments(data.decode('utf-8', 'ignore'), 'js').replace('//', ' '), 'js', name)
                 else:
-                    members.append((name, scan_bytes(data, 'py' if ext == '.py' else 'js', name)))
-    except (zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError) as exc:
-        logger.warning('Could not read archive for scanning: %s', exc)
-        return {'level': THREAT_MEDIUM, 'score': SCAN_MEDIUM_SCORE, 'file': os.path.basename(zip_path), 'type': 'zip',
-                'scanner': SCANNER_VERSION, 'reasons': [{'id': 'unreadable', 'text': SCAN_RULES['unreadable'][3], 'points': 30,
-                                                          'floor': THREAT_MEDIUM, 'lines': [], 'details': []}]}
-    if bundled:
-        extra.append(('bundled_libs', 1, 'vendored folders'))
-    if compiled:
-        extra.append(('compiled_file', 1, 'compiled files'))
-    if shell:
-        extra.append(('shell_script', 1, '.sh'))
-    worst = score_findings(extra)
-    reasons = list(worst['reasons'])
-    level, score = worst['level'], worst['score']
-    for name, result in members:
-        if THREAT_RANK[result['level']] > THREAT_RANK[level]:
-            level = result['level']
-        score = max(score, result['score'])
-        for reason in result['reasons']:
-            tagged = dict(reason)
-            tagged['text'] = f"{reason['text']} [in {name}]"
-            reasons.append(tagged)
-    reasons.sort(key=lambda item: (-THREAT_RANK[item['floor']], -item['points']))
-    return {'level': level, 'score': score, 'reasons': reasons, 'file': os.path.basename(zip_path), 'type': 'zip',
-            'scanner': SCANNER_VERSION, 'files_scanned': len(members)}
-
-
-def scan_summary_text(result, max_reasons=5):
-    """Plain-language bullet lines for people (uploader and admins)."""
-    lines = []
-    for reason in result.get('reasons', [])[:max_reasons]:
-        where = f" (line {reason['lines'][0]})" if reason.get('lines') else ''
-        lines.append(f"• {reason['text']}{where}")
-    extra = len(result.get('reasons', [])) - max_reasons
-    if extra > 0:
-        lines.append(f'• ...and {extra} more')
-    return '\n'.join(lines)
+                    sub = scan_bytes(data, kind, name)
+                scanned += 1
+                for reason in sub['reasons']:
+                    tagged = dict(reason)
+                    tagged['text'] = f"{reason['text']} [in {name}]"
+                    findings.append(tagged)
+    except Exception as exc:
+        logger.warning('Could not read archive for scanning (treated as LOW): %s', exc)
+        findings = []
+    result = _build_result(findings, os.path.basename(zip_path), 'zip', 0)
+    result['files_scanned'] = scanned
+    return result
 
 
 def scan_headline(result):
     level = result.get('level', THREAT_LOW)
-    return f"{THREAT_BADGE[level]} Threat level: {THREAT_NAME[level]} (score {result.get('score', 0)})"
+    return f"{THREAT_BADGE.get(level, '⚪')} {THREAT_NAME.get(level, level)}"
 
 
-# --- Upload review queue, scan records, launch gate and Security Center ---------------------
+def scan_summary_text(result, max_reasons=3):
+    """Short plain bullet lines for people (uploader and admins)."""
+    lines = []
+    for reason in result.get('reasons', [])[:max_reasons]:
+        where = f" (line {reason['lines'][0]})" if reason.get('lines') else ''
+        lines.append(f"• {reason['text']}{where}")
+    return '\n'.join(lines)
+
+
+# --- Upload review queue, scan records and launch gate ---------------------
 # Everything in this section is static: it stores verdicts, moves bytes around and shows buttons.
 # Nothing here ever executes an uploaded file. Execution only happens through run_script /
 # run_js_script, and only after a LOW verdict or an explicit admin approval.
@@ -1455,9 +1237,7 @@ PENDING_REVIEWS = {}                # token -> entry dict (see _submit_for_revie
 REVIEW_TTL = 3 * 24 * 3600          # an unanswered review expires after 3 days
 REVIEW_MAX_TOTAL = 30               # most uploads that may wait for review at the same time
 REVIEW_MAX_PER_USER = 3             # most uploads one user may have waiting
-RECENT_SCANS = deque(maxlen=15)     # in-memory activity feed for the Security Center
 _TOKEN_RE = re.compile(r'[0-9a-f]{8}')
-RESCAN_ALL_CAP = 500
 
 
 class _ChatRef:
@@ -1579,7 +1359,7 @@ def _badge_for(level, decision=''):
 
 
 def _scan_upload(data, ext, name):
-    """Static scan of freshly uploaded bytes. Never raises: any problem becomes a MEDIUM 'unreadable' verdict."""
+    """Static scan of freshly uploaded bytes. Never raises: a scanner problem is logged and counted as LOW."""
     try:
         if ext == '.zip':
             fd, tmp_path = tempfile.mkstemp(prefix='demon_scan_', suffix='.zip')
@@ -1596,10 +1376,9 @@ def _scan_upload(data, ext, name):
             return result
         return scan_bytes(data, ext[1:], name)
     except Exception:
-        logger.exception('Scanner failed on %s; treating as MEDIUM', name)
-        result = score_findings([('unreadable', 1, 'scanner error')])
-        result.update({'file': name, 'type': ext[1:], 'size': len(data), 'scanner': SCANNER_VERSION,
-                       'sha256': hashlib.sha256(data).hexdigest()})
+        logger.exception('Scanner failed on %s; treating as LOW', name)
+        result = _build_result([], name, ext[1:], len(data))
+        result['sha256'] = hashlib.sha256(data).hexdigest()
         return result
 
 
@@ -1610,15 +1389,10 @@ def _scan_disk_file(path, file_type):
             data = handle.read(SCAN_MAX_SOURCE_BYTES + 1)
         result = scan_bytes(data, file_type, os.path.basename(path))
     except Exception:
-        logger.exception('Scanner failed on %s; treating as MEDIUM', path)
-        result = score_findings([('unreadable', 1, 'scanner error')])
-        result.update({'file': os.path.basename(path), 'type': file_type, 'scanner': SCANNER_VERSION})
+        logger.exception('Scanner failed on %s; treating as LOW', path)
+        result = _build_result([], os.path.basename(path), file_type, 0)
     result['sha256'] = _file_sha256(path) or result.get('sha256', '')
     return result
-
-
-def _note_scan_event(user_id, file_name, level, what):
-    RECENT_SCANS.append((time.time(), user_id, file_name, level, what))
 
 
 def _reason_lines_html(result, limit=5, details=False):
@@ -1635,17 +1409,14 @@ def _reason_lines_html(result, limit=5, details=False):
 
 
 def _user_verdict_text(result, file_name, outcome):
-    """What the uploader sees. outcome: 'auto' (LOW), 'review' (MEDIUM) or 'rejected' (HIGH)."""
-    level = result['level']
-    head = f"{THREAT_BADGE[level]} <b>Threat level: {THREAT_NAME[level]}</b> (score {result.get('score', 0)})\n📄 <code>{html_escape(file_name)}</code>\n"
+    """What the uploader sees: one or two short lines. outcome: 'auto' (LOW), 'review' (MEDIUM) or 'rejected' (HIGH)."""
+    name = html_escape(file_name)
     if outcome == 'auto':
-        return head + '\nNo risky behaviour found. Starting it automatically...'
-    why = _reason_lines_html(result, 5)
+        return f"{THREAT_BADGE[THREAT_LOW]} <code>{name}</code> - safe lagi, start ho raha hai."
+    why = _reason_lines_html(result, 2)
     if outcome == 'review':
-        return (head + '\nSome things in this file need an admin to look at them:\n' + why +
-                '\n\n⏳ It was <b>not started</b>. I sent it to the admin for approval and will message you with the decision.')
-    return (head + '\nWhy this was stopped:\n' + why +
-            '\n\n⛔ <b>Rejected.</b> The file was not started and not saved. Remove the flagged parts and upload it again.')
+        return (f"{THREAT_BADGE[THREAT_MEDIUM]} <code>{name}</code> - admin approval chahiye, abhi start nahi hua.\n{why}")
+    return f"{THREAT_BADGE[THREAT_HIGH]} <code>{name}</code> - reject ho gaya (khatarnak code mila).\n{why}"
 
 
 # ---- review registry -----------------------------------------------------------------------
@@ -1734,44 +1505,28 @@ def _user_pending_count(user_id):
 
 
 def _review_text(entry, expanded=False, outcome=None):
+    """Admin detail view of one waiting file (short)."""
     level = entry['level']
-    kind_note = 'Upload waiting for approval' if entry['kind'] == 'upload' else 'Hosted file needs a security decision'
     created = datetime.fromtimestamp(entry['created']).strftime('%d %b %H:%M')
-    reasons = _reason_lines_html(entry, 12 if expanded else 3, details=expanded) or '• (no details stored)'
-    lines = ["<b>🛡 SECURITY REVIEW</b>\n━━━━━━━━━━━━━━━━━━",
-             f"<i>{kind_note}</i>",
-             f"📄 <b>File:</b> <code>{html_escape(entry['file_name'])}</code> ({html_escape(entry['file_type'])})",
-             f"👤 <b>From:</b> {html_escape(entry['uploader'] or 'user')} (<code>{entry['user_id']}</code>)",
-             f"{THREAT_BADGE[level]} <b>Threat level:</b> {THREAT_NAME[level]} (score {entry['score']})",
-             f"🕒 <b>Received:</b> {created}",
-             f"🔑 <b>Fingerprint:</b> <code>{html_escape(entry['sha256'][:12])}</code>",
-             '', '<b>Flagged because:</b>', reasons]
+    reasons = _reason_lines_html(entry, 4) or '• (no details stored)'
+    lines = [f"{THREAT_BADGE[level]} <b>Approval chahiye</b>: <code>{html_escape(entry['file_name'])}</code>",
+             f"User: {html_escape(entry['uploader'] or 'user')} (<code>{entry['user_id']}</code>) - {created}",
+             reasons]
+    source = _review_source(entry)
+    if source:
+        lines.insert(2, source)
     if outcome:
         lines += ['', outcome]
-    else:
-        lines += ['', '<i>Approve starts it. Reject deletes it. Nothing runs until you decide.</i>']
     return '\n'.join(lines)
 
 
-def _review_markup(entry, expanded=False, in_panel=False):
+def _review_markup(entry, expanded=False, in_panel=True):
     token = entry['token']
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(types.InlineKeyboardButton('✅ Approve & run', callback_data=f'rv_a_{token}'),
-           types.InlineKeyboardButton('❌ Reject', callback_data=f'rv_r_{token}'))
-    toggle = (types.InlineKeyboardButton('🔼 Less detail', callback_data=f'rv_s_{token}') if expanded
-              else types.InlineKeyboardButton('🔍 More detail', callback_data=f'rv_d_{token}'))
-    kb.row(toggle, types.InlineKeyboardButton('📄 Get file to read', callback_data=f'rv_f_{token}'))
-    if in_panel:
-        kb.row(types.InlineKeyboardButton('🔙 Review queue', callback_data='sec_queue'),
-               types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
-    else:
-        kb.row(types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
-    return kb
-
-
-def _decided_markup():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
+    kb = NavMenu(row_width=2)
+    kb.row(NavButton('✅ Approve & run', callback_data=f'rv_a_{token}'),
+           NavButton('❌ Reject', callback_data=f'rv_r_{token}'))
+    kb.row(NavButton('📄 Get file to read', callback_data=f'rv_f_{token}'),
+           NavButton('⬅️ Back to approvals', callback_data='adm_approvals'))
     return kb
 
 
@@ -1819,9 +1574,15 @@ def _submit_for_review(user_id, uploader, chat_id, msg_id, file_name, file_type,
                 return None, 'Could not store the file for review. Please try again later.'
         PENDING_REVIEWS[token] = entry
     _review_db_save(entry)
-    text, markup = _review_text(entry), _review_markup(entry)
+    # Admins get a plain notice with NO buttons (so their menu keyboard is left alone); they decide in Admin > Approvals.
+    notice = (f"{THREAT_BADGE[result['level']]} Naya approval: <code>{html_escape(file_name)}</code> "
+              f"(user {html_escape(uploader or str(user_id))}). Admin panel > Approvals mein dekho.")
+    if kind == 'upload' and file_type == 'zip':
+        source = _gh_source_line(gh_manifest_from_zip_bytes(data))
+        if source:
+            notice += '\n' + source
     for admin_id in sorted(admin_ids):
-        sent = _safe_send(admin_id, text, reply_markup=markup)
+        sent = _safe_send(admin_id, notice)
         if sent is not None:
             entry['admin_msgs'][str(admin_id)] = sent.message_id
     _review_db_save(entry)
@@ -1841,10 +1602,8 @@ def _expire_reviews():
                 _remove_quietly(_quarantine_path(token) if entry['kind'] == 'upload' else None)
     for entry in expired:
         _review_db_delete(entry['token'])
-        _note_scan_event(entry['user_id'], entry['file_name'], entry['level'], 'expired')
-        _review_edit_all(entry, _review_text(entry, outcome='⌛ <b>Expired</b> with no decision.'), _decided_markup())
-        _safe_send(entry['chat_id'], f"⌛ Your file <code>{html_escape(entry['file_name'])}</code> was not reviewed in time and was removed. "
-                                     'Please upload it again if you still need it.')
+        _review_edit_all(entry, _review_text(entry, outcome='⌛ Expired, kisi ne decide nahi kiya.'), None)
+        _safe_send(entry['chat_id'], f"⌛ <code>{html_escape(entry['file_name'])}</code> ka review time par nahi hua, hata diya. Zarurat ho to dobara upload karo.")
 
 
 def _deploy_upload(user_id, file_name, file_type, data, reply_obj, result, decision):
@@ -1914,11 +1673,10 @@ def _review_forget(entry):
 def _review_approve(call, token):
     entry = _review_claim(token)
     if entry is None:
-        bot.answer_callback_query(call.id, 'Someone already handled this request.', show_alert=True)
-        _safe_clear_buttons(call)
+        bot.answer_callback_query(call.id, 'Ye request pehle hi handle ho chuki hai.', show_alert=True)
+        _show_approvals(call)
         return
-    admin_name = html_escape(call.from_user.first_name or 'Admin')
-    bot.answer_callback_query(call.id, '✅ Approved. Starting it now...')
+    bot.answer_callback_query(call.id, '✅ Approved. Start ho raha hai...')
     ok, err = False, 'Unknown problem.'
     try:
         user_id, file_name, file_type = entry['user_id'], entry['file_name'], entry['file_type']
@@ -1930,7 +1688,8 @@ def _review_approve(call, token):
                 data = handle.read()
             if hashlib.sha256(data).hexdigest() != entry['sha256']:
                 err = 'The held file no longer matches its fingerprint, so it was not started.'
-            elif get_user_file_count(user_id) >= get_user_file_limit(user_id):
+            elif get_user_file_count(user_id) >= get_user_file_limit(user_id) and not (
+                    file_type == 'zip' and (gh_manifest_from_zip_bytes(data) or {}).get('update')):
                 err = 'The user has reached their file limit.'
             else:
                 ok, err = _deploy_upload(user_id, file_name, file_type, data, reply_obj, entry, 'approved')
@@ -1950,60 +1709,71 @@ def _review_approve(call, token):
         ok, err = False, 'Something went wrong while starting the file.'
     if not ok:
         _review_release(token)
-        notice = _review_text(entry, outcome=f'⚠️ <b>Could not start:</b> {html_escape(err)}\nIt is still waiting.')
-        try:
-            bot.edit_message_text(notice, call.message.chat.id, call.message.message_id, parse_mode='HTML',
-                                  reply_markup=_review_markup(entry, in_panel=True))
-        except Exception:
-            _safe_send(call.message.chat.id, f'⚠️ Could not start <code>{html_escape(entry["file_name"])}</code>: {html_escape(err)}')
+        _safe_send(call.message.chat.id, f'⚠️ <code>{html_escape(entry["file_name"])}</code> start nahi ho paya: {html_escape(err)}\nAbhi bhi approvals mein hai.')
         return
     _review_forget(entry)
-    _note_scan_event(entry['user_id'], entry['file_name'], entry['level'], 'approved')
     logger.info('Review %s approved by %s', token, call.from_user.id)
-    outcome = f'✅ <b>Approved</b> by {admin_name} and started.'
-    _review_edit_all(entry, _review_text(entry, outcome=outcome), _decided_markup())
-    try:
-        bot.edit_message_text(_review_text(entry, outcome=outcome), call.message.chat.id, call.message.message_id,
-                              parse_mode='HTML', reply_markup=_decided_markup())
-    except Exception:
-        pass
-    _safe_send(entry['chat_id'], f"✅ An admin approved <code>{html_escape(entry['file_name'])}</code>. It is starting now.")
+    admin_name = html_escape(call.from_user.first_name or 'Admin')
+    _review_edit_all(entry, _review_text(entry, outcome=f'✅ Approved by {admin_name}.'), None)
+    _safe_send(entry['chat_id'], f"✅ Admin ne <code>{html_escape(entry['file_name'])}</code> approve kar diya, start ho raha hai.")
+    _show_approvals(call)
 
 
 def _review_reject(call, token):
     entry = _review_claim(token)
     if entry is None:
-        bot.answer_callback_query(call.id, 'Someone already handled this request.', show_alert=True)
-        _safe_clear_buttons(call)
+        bot.answer_callback_query(call.id, 'Ye request pehle hi handle ho chuki hai.', show_alert=True)
+        _show_approvals(call)
         return
     bot.answer_callback_query(call.id, '❌ Rejected.')
     if entry['kind'] == 'existing':
         set_scan_decision(entry['user_id'], entry['file_name'], 'rejected')
     _review_forget(entry)
-    _note_scan_event(entry['user_id'], entry['file_name'], entry['level'], 'rejected')
     logger.info('Review %s rejected by %s', token, call.from_user.id)
-    outcome = f"❌ <b>Rejected</b> by {html_escape(call.from_user.first_name or 'Admin')}. The file will not run."
-    _review_edit_all(entry, _review_text(entry, outcome=outcome), _decided_markup())
-    try:
-        bot.edit_message_text(_review_text(entry, outcome=outcome), call.message.chat.id, call.message.message_id,
-                              parse_mode='HTML', reply_markup=_decided_markup())
-    except Exception:
-        pass
-    _safe_send(entry['chat_id'], f"❌ An admin rejected <code>{html_escape(entry['file_name'])}</code> for security reasons. It was not started.")
+    _review_edit_all(entry, _review_text(entry, outcome=f"❌ Rejected by {html_escape(call.from_user.first_name or 'Admin')}."), None)
+    _safe_send(entry['chat_id'], f"❌ Admin ne <code>{html_escape(entry['file_name'])}</code> reject kar diya (security). Start nahi hua.")
+    _show_approvals(call)
 
 
-def _safe_clear_buttons(call):
+def _approvals_view():
+    """Admin list of uploads waiting for a decision: (text, menu)."""
+    _expire_reviews()
+    with REVIEW_LOCK:
+        items = sorted((dict(item) for item in PENDING_REVIEWS.values()), key=lambda item: item['created'])
+    kb = NavMenu(row_width=1)
+    if items:
+        text = f'<b>📥 Approvals ({len(items)})</b>\nKisi ko kholo, reason padho, phir Approve ya Reject.'
+        for number, item in enumerate(items[:20], 1):
+            who = (item['uploader'] or str(item['user_id']))[:14]
+            kb.add(NavButton(f"{number}. {THREAT_BADGE[item['level']]} {item['file_name'][:22]} - {who}",
+                                              callback_data=f"rv_o_{item['token']}"))
+        if len(items) > 20:
+            text += f'\n<i>Pehle 20 dikha raha hoon, total {len(items)}.</i>'
+    else:
+        text = '<b>📥 Approvals (0)</b>\n✅ Kuch pending nahi hai.'
+    kb.add(NavButton('🔄 Refresh', callback_data='adm_approvals'))
+    kb.add(NavButton('👑 Admin Panel', callback_data='admin_dashboard'))
+    return text, kb
+
+
+def _show_approvals(call):
+    text, kb = _approvals_view()
     try:
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=_decided_markup())
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
     except Exception:
-        pass
+        _safe_send(call.message.chat.id, text, reply_markup=kb)
+
+
+def approvals_callback(call):
+    bot.answer_callback_query(call.id)
+    _show_approvals(call)
 
 
 def review_callback(call):
-    """Routes rv_a_ / rv_r_ / rv_d_ / rv_s_ / rv_f_ / rv_o_ buttons (admin only, checked by the caller)."""
+    """Routes rv_a_ / rv_r_ / rv_f_ / rv_o_ buttons (admin only, checked by the caller)."""
     parts = (call.data or '').split('_', 2)
     if len(parts) != 3 or not _TOKEN_RE.fullmatch(parts[2]):
-        bot.answer_callback_query(call.id, 'That button is not valid any more.', show_alert=True)
+        bot.answer_callback_query(call.id, 'Ye button ab valid nahi hai.', show_alert=True)
         return
     action, token = parts[1], parts[2]
     if action == 'a':
@@ -2014,25 +1784,23 @@ def review_callback(call):
         entry = PENDING_REVIEWS.get(token)
         entry = dict(entry) if entry else None
     if entry is None:
-        bot.answer_callback_query(call.id, 'This request was already handled or has expired.', show_alert=True)
-        _safe_clear_buttons(call)
+        bot.answer_callback_query(call.id, 'Ye request handle ho chuki hai ya expire ho gayi.', show_alert=True)
+        _show_approvals(call)
         return
-    in_panel = action == 'o'
     if action in ('d', 's', 'o'):
-        expanded = action == 'd'
         bot.answer_callback_query(call.id)
-        bot.edit_message_text(_review_text(entry, expanded=expanded), call.message.chat.id, call.message.message_id,
-                              parse_mode='HTML', reply_markup=_review_markup(entry, expanded=expanded, in_panel=in_panel))
+        bot.edit_message_text(_review_text(entry), call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=_review_markup(entry))
         return
     if action == 'f':
         path = _quarantine_path(token) if entry['kind'] == 'upload' else os.path.join(get_user_folder(entry['user_id']), entry['file_name'])
         if not os.path.isfile(path):
-            bot.answer_callback_query(call.id, 'The file is not available any more.', show_alert=True)
+            bot.answer_callback_query(call.id, 'File ab available nahi hai.', show_alert=True)
             return
-        bot.answer_callback_query(call.id, 'Sending a copy to read...')
+        bot.answer_callback_query(call.id, 'Copy bhej raha hoon...')
         with open(path, 'rb') as handle:
             bot.send_document(call.message.chat.id, types.InputFile(handle, file_name=entry['file_name']),
-                              caption='Review copy. Read it, do not run it.')
+                              caption='Review copy. Padho, run mat karo.')
         return
     bot.answer_callback_query(call.id, 'Unknown action.')
 
@@ -2040,8 +1808,11 @@ def review_callback(call):
 # ---- launch gate ------------------------------------------------------------------------------
 def launch_gate(owner_id, file_name, file_type, actor_id, queue=True, admin_override=True):
     """Decide whether a hosted file may be started. Returns (allowed, note_html).
+    Admin-owned files run directly. For everyone else: LOW runs, MEDIUM needs an admin approval, HIGH never runs.
     A stored verdict is only trusted while the file on disk still has the fingerprint that was scanned;
-    otherwise the file is scanned again first. HIGH never runs. MEDIUM runs only after approval."""
+    otherwise (or when there is no record yet, e.g. old files) it is scanned again silently."""
+    if owner_id in admin_ids:
+        return True, ''
     path = os.path.join(get_user_folder(owner_id), file_name)
     sha = _file_sha256(path)
     if sha is None:
@@ -2052,158 +1823,45 @@ def launch_gate(owner_id, file_name, file_type, actor_id, queue=True, admin_over
         save_scan_record(owner_id, file_name, result, 'rescan' if result['level'] == THREAT_LOW else '')
         rec = {'level': result['level'], 'score': result['score'], 'reasons': result['reasons'], 'sha256': sha,
                'decision': 'rescan' if result['level'] == THREAT_LOW else ''}
-        _note_scan_event(owner_id, file_name, result['level'], 'rescan')
     level, decision = rec['level'], rec['decision']
-    head = f"{THREAT_BADGE.get(level, '⚪')} <b>Threat level: {THREAT_NAME.get(level, level)}</b> (score {rec['score']})"
-    why = _reason_lines_html(rec, 4)
-    if level == THREAT_HIGH:
-        return False, f"{head}\n{why}\n\n⛔ <b>Blocked.</b> High-threat files are never started. Delete it from this panel."
+    why = _reason_lines_html(rec, 2)
     if decision == 'rejected':
-        return False, f"{head}\n\n⛔ An admin rejected this file earlier, so it will not start."
+        return False, f"{THREAT_BADGE[THREAT_HIGH]} Admin ne ye file pehle reject ki thi, start nahi hogi."
+    if level == THREAT_HIGH:
+        return False, f"{THREAT_BADGE[THREAT_HIGH]} Khatarnak code mila, start nahi hoga.\n{why}"
     if level == THREAT_LOW or decision in ('approved', 'admin'):
         return True, ''
-    if admin_override and (owner_id in admin_ids or actor_id in admin_ids):
+    if admin_override and actor_id in admin_ids:
         set_scan_decision(owner_id, file_name, 'admin')
-        _note_scan_event(owner_id, file_name, level, 'admin start')
         return True, ''
     if not queue:
-        return False, f"{head}\n{why}\n\n🕵️ Needs an admin decision first."
-    owner_chat = owner_id
-    token, err = _submit_for_review(owner_id, str(owner_id), owner_chat, None, file_name, file_type, None,
+        return False, f"{THREAT_BADGE[THREAT_MEDIUM]} Admin approval chahiye.\n{why}"
+    token, err = _submit_for_review(owner_id, str(owner_id), owner_id, None, file_name, file_type, None,
                                     dict(rec, file=file_name), kind='existing')
     if token:
         with REVIEW_LOCK:
             item = PENDING_REVIEWS.get(token)
             if item is not None:
                 item['msg_id'] = None
-        return False, f"{head}\n{why}\n\n⏳ <b>Not started.</b> I sent it to the admin for approval."
-    return False, f"{head}\n{why}\n\n⏳ <b>Not started.</b> {html_escape(err)}"
+        return False, f"{THREAT_BADGE[THREAT_MEDIUM]} Start nahi hua, admin approval ke liye bhej diya.\n{why}"
+    return False, f"{THREAT_BADGE[THREAT_MEDIUM]} Start nahi hua. {html_escape(err)}"
 
 
-# ---- Security Center ----------------------------------------------------------------------
-def _scan_counts():
-    counts = {'low': 0, 'medium_ok': 0, 'medium': 0, 'high': 0}
+def _reset_old_pending_verdicts():
+    """Old-scanner MEDIUM/HIGH verdicts that nobody decided are forgotten so the new scanner re-checks them on next launch."""
     with DB_LOCK:
         conn = db_connect()
         try:
-            rows = conn.execute('SELECT level, decision, COUNT(*) FROM file_scans GROUP BY level, decision').fetchall()
-        except sqlite3.Error:
-            rows = []
+            conn.execute("UPDATE file_scans SET sha256 = '' WHERE level IN ('medium', 'high') "
+                         "AND decision NOT IN ('approved', 'admin', 'rejected')")
+            conn.commit()
+        except sqlite3.Error as exc:
+            logger.warning('Could not reset old scan verdicts: %s', exc)
         finally:
             conn.close()
-    for level, decision, count in rows:
-        if level == THREAT_LOW:
-            counts['low'] += count
-        elif level == THREAT_HIGH:
-            counts['high'] += count
-        elif decision in ('approved', 'admin'):
-            counts['medium_ok'] += count
-        else:
-            counts['medium'] += count
-    return counts
 
 
-def _security_center_view():
-    counts = _scan_counts()
-    scanned = sum(counts.values())
-    hosted = sum(len(items) for items in user_files.values())
-    pending = _pending_count()
-    lines = ['<b>🛡 SECURITY CENTER</b>\n━━━━━━━━━━━━━━━━━━',
-             f'📥 <b>Waiting for your decision:</b> {pending}',
-             '',
-             '<b>Hosted files by threat level</b>',
-             f"🟢 Low: {counts['low']}",
-             f"🟡 Medium (approved): {counts['medium_ok']}",
-             f"🟡 Medium (not approved): {counts['medium']}",
-             f"🔴 High: {counts['high']}",
-             f"⚪ Not scanned yet: {max(0, hosted - scanned)}"]
-    if RECENT_SCANS:
-        lines += ['', '<b>Recent activity</b>']
-        for stamp, uid, name, level, what in list(RECENT_SCANS)[-5:][::-1]:
-            lines.append(f"{THREAT_BADGE.get(level, '⚪')} {time.strftime('%H:%M', time.localtime(stamp))} "
-                         f"<code>{html_escape(name[:24])}</code> u{uid} - {html_escape(what)}")
-    lines += ['', f'<i>Updated {datetime.now().strftime("%H:%M:%S")}. Scanner v{SCANNER_VERSION}.</i>']
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(types.InlineKeyboardButton(f'📥 Review queue ({pending})', callback_data='sec_queue'),
-           types.InlineKeyboardButton('🔄 Refresh', callback_data='sec_center'))
-    kb.row(types.InlineKeyboardButton('🔍 Rescan hosted files', callback_data='sec_rescan'))
-    kb.row(types.InlineKeyboardButton('👑 Admin Center', callback_data='admin_dashboard'),
-           types.InlineKeyboardButton('🏠 Main Menu', callback_data='back_to_main'))
-    return '\n'.join(lines), kb
-
-
-def security_center_callback(call):
-    bot.answer_callback_query(call.id)
-    _expire_reviews()
-    text, kb = _security_center_view()
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
-
-
-def security_queue_callback(call):
-    bot.answer_callback_query(call.id)
-    _expire_reviews()
-    with REVIEW_LOCK:
-        items = sorted((dict(item) for item in PENDING_REVIEWS.values()), key=lambda item: item['created'])
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    if items:
-        text = f'<b>📥 REVIEW QUEUE</b>\n━━━━━━━━━━━━━━━━━━\n{len(items)} waiting. Tap one to read the reasons and decide.'
-        for item in items[:10]:
-            label = f"{THREAT_BADGE[item['level']]} {item['file_name'][:24]} - {(item['uploader'] or str(item['user_id']))[:14]}"
-            kb.add(types.InlineKeyboardButton(label, callback_data=f"rv_o_{item['token']}"))
-        if len(items) > 10:
-            text += f'\n<i>Showing the oldest 10 of {len(items)}.</i>'
-    else:
-        text = '<b>📥 REVIEW QUEUE</b>\n━━━━━━━━━━━━━━━━━━\n✅ Nothing is waiting. All clear.'
-    kb.row(types.InlineKeyboardButton('🔄 Refresh', callback_data='sec_queue'),
-           types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
-
-
-def security_rescan_callback(call):
-    """Scan every hosted file again with the current scanner. Approvals stay valid only while the file is unchanged."""
-    if not SCAN_RESCAN_LOCK.acquire(blocking=False):
-        bot.answer_callback_query(call.id, 'A rescan is already running.', show_alert=True)
-        return
-    try:
-        bot.answer_callback_query(call.id, 'Scanning hosted files...')
-        entries = [(uid, name, ftype) for uid, items in list(user_files.items()) for name, ftype in list(items)]
-        capped = len(entries) > RESCAN_ALL_CAP
-        entries = entries[:RESCAN_ALL_CAP]
-        try:
-            bot.edit_message_text(f'<b>🔍 Scanning {len(entries)} hosted file(s)...</b>\nThis only reads the files. Nothing is started.',
-                                  call.message.chat.id, call.message.message_id, parse_mode='HTML')
-        except Exception:
-            pass
-        changed, high_names, missing = 0, [], 0
-        for uid, name, ftype in entries:
-            path = os.path.join(get_user_folder(uid), name)
-            if not os.path.isfile(path):
-                missing += 1
-                continue
-            old = get_scan_record(uid, name)
-            result = _scan_disk_file(path, ftype)
-            keep = old['decision'] if old and old['sha256'] == result['sha256'] and old['decision'] in ('approved', 'admin', 'rejected') else ''
-            if not old or old['level'] != result['level']:
-                changed += 1
-            save_scan_record(uid, name, result, keep or ('rescan' if result['level'] == THREAT_LOW else ''))
-            if result['level'] == THREAT_HIGH:
-                high_names.append(f'{name} (u{uid})')
-        _note_scan_event(call.from_user.id, 'all hosted files', THREAT_LOW, f'rescan {len(entries)}')
-        summary = f'<b>✅ Rescan finished</b>: {len(entries) - missing} file(s) checked, {changed} verdict(s) changed.'
-        if missing:
-            summary += f'\n{missing} file(s) were missing on disk.'
-        if capped:
-            summary += f'\nOnly the first {RESCAN_ALL_CAP} files were checked.'
-        if high_names:
-            summary += '\n\n🔴 <b>High threat (blocked from starting):</b>\n' + '\n'.join('• ' + html_escape(n) for n in high_names[:8])
-            summary += '\nAny of these that are running right now keep running until you stop them.'
-        text, kb = _security_center_view()
-        bot.edit_message_text(summary + '\n\n' + text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
-    finally:
-        SCAN_RESCAN_LOCK.release()
-
-
-SCAN_RESCAN_LOCK = threading.Lock()
+_reset_old_pending_verdicts()
 _reviews_load()   # uploads that were waiting for an admin before the last restart
 
 
@@ -2297,20 +1955,20 @@ def remove_mandatory_channel_db(channel_id):
 
 def create_mandatory_channels_menu():
     """Create mandatory channels management menu"""
-    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup = NavMenu(row_width=2)
     markup.row(
-        types.InlineKeyboardButton('➕ Add Channel', callback_data='add_mandatory_channel'),
-        types.InlineKeyboardButton('➖ Remove Channel', callback_data='remove_mandatory_channel')
+        NavButton('➕ Add Channel', callback_data='add_mandatory_channel'),
+        NavButton('➖ Remove Channel', callback_data='remove_mandatory_channel')
     )
-    markup.row(types.InlineKeyboardButton('📋 List Channels', callback_data='list_mandatory_channels'))
-    markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
+    markup.row(NavButton('📋 List Channels', callback_data='list_mandatory_channels'))
+    markup.row(NavButton('🔙 Back to Main', callback_data='back_to_main'))
     return markup
 
 def create_subscription_check_message(not_joined_channels):
     """Create subscription verification message"""
     message = "📢 <b>Important: Join Our Channels First:</b>\n\n"
     
-    markup = types.InlineKeyboardMarkup()
+    markup = NavMenu()
     
     for channel_id, channel_info in not_joined_channels:
         channel_username = channel_info.get('username', '')
@@ -2326,11 +1984,11 @@ def create_subscription_check_message(not_joined_channels):
 
         message += f"• {html_escape(str(channel_name))}\n"
         if channel_link:
-            markup.add(types.InlineKeyboardButton(f"Join {channel_name}"[:64], url=channel_link))
+            markup.add(NavButton(f"Join {channel_name}"[:64], url=channel_link))
         else:
             message += "  Private invite link unavailable; contact the bot owner.\n"
     
-    markup.add(types.InlineKeyboardButton("✅ Verify Subscription", callback_data='check_subscription_status'))
+    markup.add(NavButton("✅ Verify Subscription", callback_data='check_subscription_status'))
     
     return message, markup
 
@@ -2926,61 +2584,54 @@ def remove_admin_db(admin_id):
         finally: conn.close()
 
 # --- Menu creation (Inline and ReplyKeyboards) ---
-def create_reply_main_menu(user_id):
-    """Persistent Telegram reply keyboard for quick access to common actions."""
-    markup = types.ReplyKeyboardMarkup(
-        row_width=2, resize_keyboard=True, one_time_keyboard=False,
-        selective=False, input_field_placeholder="Choose a hosting action..."
-    )
-    markup.row(types.KeyboardButton("📤 Upload File"), types.KeyboardButton("📂 Check Files"))
-    markup.row(types.KeyboardButton("⚡ Bot Speed"), types.KeyboardButton("📊 Statistics"))
-    markup.row(types.KeyboardButton("👤 Account"), types.KeyboardButton("🤖 My Bots"))
-    markup.row(types.KeyboardButton("📢 Updates Channel"), types.KeyboardButton("📞 Contact Owner"))
-    markup.row(types.KeyboardButton("🆘 Help"), types.KeyboardButton("🏠 Main Menu"))
-    if user_id in admin_ids:
-        markup.row(types.KeyboardButton("👑 Admin Panel"), types.KeyboardButton("👥 User Management"))
-        markup.row(types.KeyboardButton("📢 Broadcast"), types.KeyboardButton("🩺 Hosting Health"))
-        markup.row(types.KeyboardButton("💳 Subscriptions"), types.KeyboardButton("⚙️ Settings"))
-        markup.row(types.KeyboardButton("🛠️ Manual Install"), types.KeyboardButton("📢 Channel Add"))
-        markup.row(types.KeyboardButton("🔒 Lock Bot"), types.KeyboardButton("🟢 Running All Code"))
-    return markup
-
-
 def create_main_menu_inline(user_id):
-    """Premium inline menu; retained alongside the persistent reply keyboard."""
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        types.InlineKeyboardButton('📤 Upload Script', callback_data='upload'),
-        types.InlineKeyboardButton('📂 My Files', callback_data='check_files')
-    )
-    markup.row(
-        types.InlineKeyboardButton('👤 My Account', callback_data='user_account'),
-        types.InlineKeyboardButton('🤖 My Running Bots', callback_data='my_running')
-    )
-    markup.row(
-        types.InlineKeyboardButton('⚡ Speed Test', callback_data='speed'),
-        types.InlineKeyboardButton('📊 Statistics', callback_data='stats')
-    )
-    markup.row(
-        types.InlineKeyboardButton('📦 Module Install', callback_data='manual_install'),
-        types.InlineKeyboardButton('🆘 Help', callback_data='user_help')
-    )
-    markup.row(
-        types.InlineKeyboardButton('📢 Updates', url=f'https://t.me/{UPDATE_CHANNEL.replace("@", "")}'),
-        types.InlineKeyboardButton('📞 Support', url=f'https://t.me/{YOUR_USERNAME.replace("@", "")}')
-    )
+    """Main menu (a NavMenu, sent as a reply keyboard). Backup export/import is here for every user."""
+    markup = NavMenu(row_width=2)
+    markup.row(NavButton('📤 Upload Script', callback_data='upload'),
+               NavButton('📂 My Files', callback_data='check_files'))
+    markup.row(NavButton('👤 My Account', callback_data='user_account'),
+               NavButton('🤖 My Running Bots', callback_data='my_running'))
+    markup.row(NavButton('📦 Export Backup', callback_data=f'ubk_{user_id}'),
+               NavButton('♻️ Import Backup', callback_data=f'ubr_{user_id}'))
+    markup.row(NavButton('⚡ Speed Test', callback_data='speed'),
+               NavButton('📊 Statistics', callback_data='stats'))
+    markup.row(NavButton('📦 Module Install', callback_data='manual_install'),
+               NavButton('🆘 Help', callback_data='user_help'))
+    markup.row(NavButton('📢 Updates', url=f'https://t.me/{UPDATE_CHANNEL.replace("@", "")}'),
+               NavButton('📞 Support', url=f'https://t.me/{YOUR_USERNAME.replace("@", "")}'))
     if user_id in admin_ids:
-        markup.row(types.InlineKeyboardButton('👑 ADMIN CONTROL CENTER', callback_data='admin_dashboard'))
-        markup.row(
-            types.InlineKeyboardButton('🩺 Hosting Health', callback_data='hosting_health'),
-            types.InlineKeyboardButton('⚙️ Admin Settings', callback_data='admin_settings')
-        )
-        markup.row(
-            types.InlineKeyboardButton('👥 User Management', callback_data='user_management'),
-            types.InlineKeyboardButton('📢 Broadcast', callback_data='broadcast')
-        )
-        markup.row(types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
+        markup.row(NavButton('👑 Admin Center', callback_data='admin_dashboard'),
+                   NavButton(f'📥 Approvals ({_pending_count()})', callback_data='adm_approvals'))
+        markup.row(NavButton('🩺 Hosting Health', callback_data='hosting_health'),
+                   NavButton('⚙️ Admin Settings', callback_data='admin_settings'))
+        markup.row(NavButton('👥 User Management', callback_data='user_management'),
+                   NavButton('📢 Broadcast', callback_data='broadcast'))
     return markup
+
+
+def _file_key_text(file_name, file_type, running, badge):
+    short = file_name if len(file_name) <= 18 else file_name[:15] + '...'
+    return f"{badge} {short} ({file_type}) {'▶️' if running else '⏹️'}"
+
+
+def _files_view(user_id):
+    """(text, NavMenu) for My Files. Export/Import Backup are always on it, even with no files."""
+    files = sorted(user_files.get(user_id, []))
+    menu = NavMenu(row_width=1)
+    scan_map = get_scan_map(user_id)
+    for file_name, file_type in files:
+        badge = _badge_for(*scan_map[file_name]) if file_name in scan_map else '⚪'
+        menu.add(NavButton(_file_key_text(file_name, file_type, is_bot_running(user_id, file_name), badge),
+                           callback_data=f'file_{user_id}_{file_name}'))
+    menu.row(NavButton('📦 Export Backup', callback_data=f'ubk_{user_id}'),
+             NavButton('♻️ Import Backup', callback_data=f'ubr_{user_id}'))
+    menu.row(NavButton('📤 Upload Script', callback_data='upload'))
+    if files:
+        text = "📂 Your files:\nTap a file to manage it, or back up / restore all your bots."
+    else:
+        text = ("📂 Your files:\n\n(No files uploaded yet)\n"
+                "Purana backup hai? Import Backup dabao. Naya hai? Upload Script dabao.")
+    return text, menu
 
 
 # --- Full backup / restore ---------------------------------------------------
@@ -3122,20 +2773,20 @@ def _download_upload(message, max_mb):
 
 
 def _confirm_markup(token):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(types.InlineKeyboardButton('✅ Yes, restore', callback_data=f'impc_yes_{token}'),
-               types.InlineKeyboardButton('❌ Cancel', callback_data=f'impc_no_{token}'))
+    markup = NavMenu(row_width=2)
+    markup.row(NavButton('✅ Yes, restore', callback_data=f'impc_yes_{token}'),
+               NavButton('❌ Cancel', callback_data=f'impc_no_{token}'))
     return markup
 
 
 def _cancel_markup():
-    return types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('❌ Cancel', callback_data='impc_cancel'))
+    return NavMenu().add(NavButton('❌ Cancel', callback_data='impc_cancel'))
 
 
 def _parts_markup():
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(types.InlineKeyboardButton('✅ Done, check backup', callback_data='impc_done'),
-               types.InlineKeyboardButton('❌ Cancel', callback_data='impc_cancel'))
+    markup = NavMenu(row_width=2)
+    markup.row(NavButton('✅ Done, check backup', callback_data='impc_done'),
+               NavButton('❌ Cancel', callback_data='impc_cancel'))
     return markup
 
 
@@ -3527,7 +3178,7 @@ def _inspect_user_backup(zip_path, payload_dir, owner_id, importer_id):
     if len(existing) + len(new_scripts) > limit:
         return False, (f'Restoring would put you over your file limit ({len(existing)} now + {len(new_scripts)} new, '
                        f'limit {limit}). Delete a bot first or ask an admin. Nothing was changed.'), None
-    # Restored scripts skip the upload review, so anything the review would flag is refused here.
+    # Only clearly harmful (HIGH) code is refused on import. Anything else is checked again by the launch gate when it is started.
     # Admins are trusted and may restore everything.
     if importer_id not in admin_ids:
         for rel in files:
@@ -3535,13 +3186,13 @@ def _inspect_user_backup(zip_path, payload_dir, owner_id, importer_id):
             if ext not in ('.py', '.js'):
                 continue
             try:
-                with open(os.path.join(bots_root, rel), 'r', encoding='utf-8', errors='ignore') as handle:
-                    reasons = _code_security_reasons(handle.read(), ext[1:])
+                with open(os.path.join(bots_root, rel), 'rb') as handle:
+                    verdict = scan_bytes(handle.read(SCAN_MAX_SOURCE_BYTES + 1), ext[1:], rel)
             except OSError:
                 continue
-            if reasons:
-                return False, (f'"{rel}" contains operations that need admin review '
-                               f'({", ".join(reasons[:3])}). Upload it normally so an admin can approve it. '
+            if verdict['level'] == THREAT_HIGH:
+                reasons = [r['text'] for r in verdict['reasons'][:2]]
+                return False, (f'"{rel}" mein khatarnak code mila ({"; ".join(reasons)}). '
                                'Nothing was changed.'), None
     info = {'files': files, 'scripts': scripts, 'new_scripts': len(new_scripts), 'bots_root': bots_root,
             'existing_files': sum(1 for rel in files if os.path.isfile(os.path.join(get_user_folder(owner_id), rel))),
@@ -4201,156 +3852,1306 @@ def _confirm_user_restore(call, entry):
 
 
 def create_control_buttons(script_owner_id, file_name, is_running=True):
-    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup = NavMenu(row_width=2)
     if is_running:
         markup.row(
-            types.InlineKeyboardButton("🔴 Stop", callback_data=f'stop_{script_owner_id}_{file_name}'),
-            types.InlineKeyboardButton("🔄 Restart", callback_data=f'restart_{script_owner_id}_{file_name}')
+            NavButton("🔴 Stop", callback_data=f'stop_{script_owner_id}_{file_name}'),
+            NavButton("🔄 Restart", callback_data=f'restart_{script_owner_id}_{file_name}')
         )
         markup.row(
-            types.InlineKeyboardButton("🗑️ Delete", callback_data=f'delete_{script_owner_id}_{file_name}'),
-            types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{script_owner_id}_{file_name}')
+            NavButton("🗑️ Delete", callback_data=f'delete_{script_owner_id}_{file_name}'),
+            NavButton("📜 Logs", callback_data=f'logs_{script_owner_id}_{file_name}')
         )
     else:
         markup.row(
-            types.InlineKeyboardButton("🟢 Start", callback_data=f'start_{script_owner_id}_{file_name}'),
-            types.InlineKeyboardButton("🗑️ Delete", callback_data=f'delete_{script_owner_id}_{file_name}')
+            NavButton("🟢 Start", callback_data=f'start_{script_owner_id}_{file_name}'),
+            NavButton("🗑️ Delete", callback_data=f'delete_{script_owner_id}_{file_name}')
         )
         markup.row(
-            types.InlineKeyboardButton("📜 View Logs", callback_data=f'logs_{script_owner_id}_{file_name}')
+            NavButton("📜 View Logs", callback_data=f'logs_{script_owner_id}_{file_name}')
         )
-    markup.row(types.InlineKeyboardButton("🔑 Environment (.env)", callback_data=f'envm_{script_owner_id}_{file_name}'))
+    try:
+        if gh_read_sidecar(get_user_folder(script_owner_id), file_name)[0] is not None:
+            markup.row(NavButton("🔄 Update from GitHub", callback_data=f'ghu_{script_owner_id}_{file_name}'))
+    except Exception:
+        pass
+    markup.row(NavButton("🔑 Environment (.env)", callback_data=f'envm_{script_owner_id}_{file_name}'))
     markup.row(
-        types.InlineKeyboardButton("📦 Export My Bots", callback_data=f'ubk_{script_owner_id}'),
-        types.InlineKeyboardButton("♻️ Import My Bots", callback_data=f'ubr_{script_owner_id}')
+        NavButton("📦 Export My Bots", callback_data=f'ubk_{script_owner_id}'),
+        NavButton("♻️ Import My Bots", callback_data=f'ubr_{script_owner_id}')
     )
-    markup.add(types.InlineKeyboardButton("🔙 Back to Files", callback_data='check_files'))
+    markup.add(NavButton("🔙 Back to Files", callback_data='check_files'))
     return markup
 
 def create_admin_panel():
-    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup = NavMenu(row_width=2)
     markup.row(
-        types.InlineKeyboardButton('➕ Add Admin', callback_data='add_admin'),
-        types.InlineKeyboardButton('➖ Remove Admin', callback_data='remove_admin')
+        NavButton('➕ Add Admin', callback_data='add_admin'),
+        NavButton('➖ Remove Admin', callback_data='remove_admin')
     )
-    markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'),
-               types.InlineKeyboardButton('🛡 Security Center', callback_data='sec_center'))
-    markup.row(types.InlineKeyboardButton('🗄 Database Backup', callback_data='database_backup'),
-               types.InlineKeyboardButton('📤 Export Users', callback_data='export_users'))
-    markup.row(types.InlineKeyboardButton('📦 Export Full Backup', callback_data='export_database'),
-               types.InlineKeyboardButton('♻️ Import Full Backup', callback_data='import_database'))
-    markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
+    markup.row(NavButton('📋 List Admins', callback_data='list_admins'),
+               NavButton(f'📥 Approvals ({_pending_count()})', callback_data='adm_approvals'))
+    markup.row(NavButton('🗄 Database Backup', callback_data='database_backup'),
+               NavButton('📤 Export Users', callback_data='export_users'))
+    markup.row(NavButton('📦 Export Full Backup', callback_data='export_database'),
+               NavButton('♻️ Import Full Backup', callback_data='import_database'))
+    markup.row(NavButton('🔙 Back to Main', callback_data='back_to_main'))
     return markup
 
 def create_user_management_menu():
-    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup = NavMenu(row_width=2)
     markup.row(
-        types.InlineKeyboardButton('🚫 Ban User', callback_data='ban_user'),
-        types.InlineKeyboardButton('✅ Unban User', callback_data='unban_user')
+        NavButton('🚫 Ban User', callback_data='ban_user'),
+        NavButton('✅ Unban User', callback_data='unban_user')
     )
     markup.row(
-        types.InlineKeyboardButton('📊 User Info', callback_data='user_info'),
-        types.InlineKeyboardButton('👥 All Users', callback_data='all_users')
+        NavButton('📊 User Info', callback_data='user_info'),
+        NavButton('👥 All Users', callback_data='all_users')
     )
     markup.row(
-        types.InlineKeyboardButton('🔧 Set User Limit', callback_data='set_user_limit'),
-        types.InlineKeyboardButton('🗑️ Remove User Limit', callback_data='remove_user_limit')
+        NavButton('🔧 Set User Limit', callback_data='set_user_limit'),
+        NavButton('🗑️ Remove User Limit', callback_data='remove_user_limit')
     )
-    markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
+    markup.row(NavButton('🔙 Back to Main', callback_data='back_to_main'))
     return markup
 
 def create_subscription_menu():
-    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup = NavMenu(row_width=2)
     markup.row(
-        types.InlineKeyboardButton('➕ Add Subscription', callback_data='add_subscription'),
-        types.InlineKeyboardButton('➖ Remove Subscription', callback_data='remove_subscription')
+        NavButton('➕ Add Subscription', callback_data='add_subscription'),
+        NavButton('➖ Remove Subscription', callback_data='remove_subscription')
     )
-    markup.row(types.InlineKeyboardButton('🔍 Check Subscription', callback_data='check_subscription'))
-    markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
+    markup.row(NavButton('🔍 Check Subscription', callback_data='check_subscription'))
+    markup.row(NavButton('🔙 Back to Main', callback_data='back_to_main'))
     return markup
 
 def create_admin_settings_menu():
-    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup = NavMenu(row_width=2)
     markup.row(
-        types.InlineKeyboardButton('📊 System Info', callback_data='system_info'),
-        types.InlineKeyboardButton('📈 Bot Performance', callback_data='bot_performance')
+        NavButton('📊 System Info', callback_data='system_info'),
+        NavButton('📈 Bot Performance', callback_data='bot_performance')
     )
     markup.row(
-        types.InlineKeyboardButton('🧹 Cleanup Files', callback_data='cleanup_files'),
-        types.InlineKeyboardButton('📋 Installation Logs', callback_data='install_logs')
+        NavButton('🧹 Cleanup Files', callback_data='cleanup_files'),
+        NavButton('📋 Installation Logs', callback_data='install_logs')
     )
     markup.row(
-        types.InlineKeyboardButton('🩺 Hosting Health', callback_data='hosting_health'),
-        types.InlineKeyboardButton('🔄 Retry Failed Bots', callback_data='retry_failed_bots')
+        NavButton('🩺 Hosting Health', callback_data='hosting_health'),
+        NavButton('🔄 Retry Failed Bots', callback_data='retry_failed_bots')
     )
-    markup.row(types.InlineKeyboardButton('👑 Admin Dashboard', callback_data='admin_dashboard'))
-    markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
+    markup.row(NavButton('👑 Admin Dashboard', callback_data='admin_dashboard'))
+    markup.row(NavButton('🔙 Back to Main', callback_data='back_to_main'))
     return markup
 
 # --- File Handling ---
-def _expire_pending_zips():
-    """Drop zip files that have waited too long for admin review (keeps memory bounded). Caller holds STATE_LOCK."""
-    now = time.time()
-    for key, stored_at in list(pending_zip_times.items()):
-        if now - stored_at > PENDING_ZIP_TTL:
-            uid, fname = key
-            pending_zip_times.pop(key, None)
-            pending_zip_files.get(uid, {}).pop(fname, None)
-            if uid in pending_zip_files and not pending_zip_files[uid]:
-                del pending_zip_files[uid]
+# =====================================================================================
+# Deploy from GitHub (public repositories only)
+# The repo is cloned into a NEW temp folder, only the important files are picked, packed into a zip
+# (plus a signed manifest) and handed to the SAME scan / approval / zip-deploy code as a manual zip upload.
+# Nothing from the repo is ever run before the scan and the start gate have passed.
+# =====================================================================================
+GH_CLONE_TIMEOUT = _env_int('GITHUB_CLONE_TIMEOUT', 120)      # seconds for clone / archive download
+GH_MAX_REPO_MB = _env_int('GITHUB_MAX_REPO_MB', 100)          # size of the fresh clone (all of it, .git included)
+GH_MAX_SELECTED_MB = _env_int('GITHUB_MAX_SELECTED_MB', 40)   # total size of the files that are kept
+GH_MAX_FILES = _env_int('GITHUB_MAX_FILES', 600)              # number of files that are kept
+GH_MAX_DATA_KB = 2048                                          # one json / yaml / txt / csv file
+GH_MAX_ASSET_KB = 512                                          # one image / font
+GH_PICK_TTL = 600                                              # seconds a "which file is the main one?" list waits
+GH_GLOBAL_LIMIT = 2                                            # deploys running at the same time (all users)
+GH_MANIFEST_NAME = '.demon_github.json'
+GH_SIDECAR_SUFFIX = '.github.json'
+
+GH_OWNER_RE = re.compile(r'^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$')
+GH_REPO_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$')
+GH_BRANCH_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$')
+GH_SEG_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$')
+GH_CODE_EXTS = ('.py', '.js', '.mjs', '.cjs')
+GH_DATA_EXTS = ('.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.txt', '.csv', '.html', '.htm', '.css', '.jinja', '.j2')
+GH_ASSET_EXTS = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.webp', '.ttf', '.otf', '.woff', '.woff2')
+GH_INFO_NAMES = ('package.json', 'package-lock.json', 'requirements.txt', 'runtime.txt', 'procfile',
+                 '.env.example', '.env.sample', '.env.template')
+GH_SKIP_DIRS = frozenset({'.git', '.github', '.gitlab', 'node_modules', 'venv', '.venv', 'env', '__pycache__', 'site-packages',
+                          'tests', 'test', '__tests__', 'docs', 'doc', '.idea', '.vscode', '.pytest_cache', '.mypy_cache',
+                          '.tox', '.cache', 'dist', 'build', '.next', 'coverage'})
+GH_PROTECTED_SUFFIXES = ('.env', '.db', '.sqlite', '.sqlite3')
+GH_UPDATE_CODE_EXTS = ('.py', '.js', '.mjs', '.cjs', '.html', '.htm', '.css', '.jinja', '.j2')
+GH_UPDATE_CODE_NAMES = ('package.json', 'package-lock.json', 'requirements.txt', 'runtime.txt', 'procfile',
+                        '.env.example', '.env.sample', '.env.template')
+
+GH_LOCK = threading.Lock()
+GH_ACTIVE_USERS = set()          # users with a deploy running or a picker waiting
+GH_PENDING = {}                  # token -> picker context
+GH_SLOTS = threading.BoundedSemaphore(GH_GLOBAL_LIMIT)
 
 
-def handle_zip_file(downloaded_file_content, file_name_zip, message):
-    user_id = message.from_user.id
-    user_folder = get_user_folder(user_id)
-    temp_dir = None 
+class GithubError(Exception):
+    """A problem with a repo link or its content. .text is safe to show to the user."""
+    def __init__(self, code, text):
+        super().__init__(text)
+        self.code = code
+        self.text = text
+
+
+def parse_github_url(text):
+    """Strict check of a pasted GitHub link. Returns {'owner','repo','branch','subdir','url','clone_url'} or raises GithubError.
+    Only https://github.com/<owner>/<repo>[.git][/tree/<branch>[/<subfolder>]] is accepted. The clone address is REBUILT from the
+    validated owner and repo, the pasted text itself is never used for anything else."""
+    bad = GithubError('url', 'Ye valid GitHub repo link nahi lag raha. Aisa bhejo: https://github.com/owner/repo '
+                             '(sirf github.com, https, public repo).')
+    raw = (text or '').strip()
+    if raw.startswith('<') and raw.endswith('>'):
+        raw = raw[1:-1].strip()
+    if not raw or len(raw) > 300:
+        raise bad
+    if any(ch.isspace() or ord(ch) < 33 or ord(ch) > 126 for ch in raw):
+        raise bad
+    if '\\' in raw or '%' in raw or '@' in raw.split('github.com', 1)[0]:
+        raise bad
+    lowered = raw.lower()
+    if lowered.startswith('http://'):
+        raise GithubError('url', 'Sirf https link chalega (http nahi). Aisa bhejo: https://github.com/owner/repo')
+    if lowered.startswith('github.com/') or lowered.startswith('www.github.com/'):
+        raw = 'https://' + raw
     try:
-        temp_dir = tempfile.mkdtemp(prefix=f"user_{user_id}_zip_")
-        logger.info(f"Temp dir for zip: {temp_dir}")
-        zip_path = os.path.join(temp_dir, file_name_zip)
-        with open(zip_path, 'wb') as new_file: new_file.write(downloaded_file_content)
-        
-        # Security check for ZIP
-        is_safe, security_msg = scan_zip_security(zip_path)
-        if not is_safe:
-            # Send security warning to admin for approval
-            security_warning_msg = f"🚨 File needs approval:\n👤 User: {user_id}\n📁 File: {file_name_zip}\n⚠️ Reason: {security_msg}"
-            markup = types.InlineKeyboardMarkup()
-            markup.row(
-                types.InlineKeyboardButton("✅ Approve", callback_data=f"approve_zip_{user_id}_{file_name_zip}"),
-                types.InlineKeyboardButton("❌ Reject", callback_data=f"reject_zip_{user_id}_{file_name_zip}")
-            )
-            for admin_id in admin_ids:
+        parts = urlsplit(raw)
+    except ValueError:
+        raise bad
+    if parts.scheme.lower() != 'https' or (parts.hostname or '').lower() not in ('github.com', 'www.github.com'):
+        raise bad
+    try:
+        port = parts.port
+    except ValueError:
+        raise bad
+    if parts.username or parts.password or port:
+        raise bad
+    segs = [s for s in parts.path.split('/') if s != '']
+    if len(segs) < 2:
+        raise bad
+    owner, repo = segs[0], segs[1]
+    if repo.lower().endswith('.git'):
+        repo = repo[:-4]
+    if not GH_OWNER_RE.fullmatch(owner) or not GH_REPO_RE.fullmatch(repo) or repo in ('.', '..') or '..' in repo:
+        raise bad
+    branch, subdir = None, None
+    rest = segs[2:]
+    if rest:
+        if rest[0] != 'tree' or len(rest) < 2 or len(rest) > 9:
+            raise GithubError('url', 'Sirf repo ka link do (ya /tree/branch/folder wala link). Issues/blob/pull links nahi chalte.')
+        branch = rest[1]
+        if not GH_BRANCH_RE.fullmatch(branch) or '..' in branch or branch.endswith('.lock') or branch.endswith('.'):
+            raise bad
+        sub = rest[2:]
+        for seg in sub:
+            if not GH_SEG_RE.fullmatch(seg) or seg in ('.', '..') or '..' in seg:
+                raise bad
+        subdir = '/'.join(sub) or None
+    base = f'https://github.com/{owner}/{repo}'
+    return {'owner': owner, 'repo': repo, 'branch': branch, 'subdir': subdir, 'url': base, 'clone_url': base + '.git'}
+
+
+def _gh_dir_size(path):
+    total = 0
+    for base, dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(base, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _gh_git_env(home_dir):
+    env = child_env()
+    env.update({'GIT_TERMINAL_PROMPT': '0', 'GIT_ASKPASS': 'true', 'SSH_ASKPASS': 'true', 'GCM_INTERACTIVE': 'never',
+                'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_LFS_SKIP_SMUDGE': '1',
+                'GIT_OPTIONAL_LOCKS': '0', 'HOME': home_dir, 'XDG_CONFIG_HOME': home_dir, 'LC_ALL': 'C'})
+    for name in list(env):
+        if name.startswith('GIT_') and name not in ('GIT_TERMINAL_PROMPT', 'GIT_ASKPASS', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL',
+                                                    'GIT_LFS_SKIP_SMUDGE', 'GIT_OPTIONAL_LOCKS'):
+            env.pop(name, None)
+    return env
+
+
+def gh_clone_command(url, dest, branch=None, local_test=False):
+    """Argument list for the shallow clone (never a shell string). `--` keeps the address from being read as an option.
+    local_test=True is only used by the tests to clone a file:// repo; users can never reach it."""
+    protocol = ['-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always']
+    if local_test:
+        protocol = ['-c', 'protocol.allow=never', '-c', 'protocol.file.allow=always']
+    cmd = ['git', '-c', 'credential.helper=', '-c', 'core.hooksPath=' + os.devnull, '-c', 'core.symlinks=false',
+           '-c', 'core.fsmonitor=false', '-c', 'submodule.recurse=false', '-c', 'http.followRedirects=false'] + protocol
+    cmd += ['clone', '--depth', '1', '--single-branch', '--no-tags', '--no-recurse-submodules', '--quiet']
+    if branch:
+        cmd += ['--branch', branch]
+    cmd += ['--', url, dest]
+    return cmd
+
+
+def _gh_stderr_code(text):
+    low = (text or '').lower()
+    if 'remote branch' in low and 'not found' in low:
+        return 'branch'
+    if any(key in low for key in ('not found', 'authentication', 'could not read username', 'terminal prompts disabled',
+                                  'repository access', 'permission denied', 'invalid username')):
+        return 'notfound'
+    return 'fail'
+
+
+def gh_clone(url, dest, branch=None, timeout=None, max_mb=None, local_test=False, home_dir=None):
+    """Shallow clone into `dest` (must not exist). Returns None on success, else one of
+    'nogit', 'notfound', 'branch', 'timeout', 'toobig', 'fail'. The partial folder is removed on any failure."""
+    timeout = GH_CLONE_TIMEOUT if timeout is None else timeout
+    max_bytes = (GH_MAX_REPO_MB if max_mb is None else max_mb) * 1024 * 1024
+    home = home_dir or tempfile.mkdtemp(prefix='demon_ghhome_')
+    code = 'fail'
+    try:
+        try:
+            proc = subprocess.Popen(gh_clone_command(url, dest, branch, local_test), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=_gh_git_env(home),
+                                    cwd=home, text=True, errors='ignore')
+        except FileNotFoundError:
+            return 'nogit'
+        except OSError:
+            return 'nogit'
+        started = time.time()
+        stderr_text = ''
+        while True:
+            try:
+                _, stderr_text = proc.communicate(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                if time.time() - started > timeout:
+                    code = 'timeout'
+                elif os.path.isdir(dest) and _gh_dir_size(dest) > max_bytes:
+                    code = 'toobig'
+                else:
+                    continue
                 try:
-                    bot.send_message(admin_id, security_warning_msg, reply_markup=markup)
-                except Exception as e:
-                    logger.error(f"Failed to send security warning to admin {admin_id}: {e}")
-            
-            # Store the file content for later approval
-            with STATE_LOCK:
-                _expire_pending_zips()
-                if sum(len(v) for v in pending_zip_files.values()) >= PENDING_ZIP_MAX_TOTAL:
-                    bot.reply_to(message, "⚠️ Too many files are waiting for review right now. Please try again later.")
+                    proc.kill()
+                    proc.communicate(timeout=10)
+                except Exception:
+                    pass
+                _rmtree_quiet(dest)
+                return code
+        if proc.returncode == 0 and os.path.isdir(dest):
+            if _gh_dir_size(dest) > max_bytes:
+                _rmtree_quiet(dest)
+                return 'toobig'
+            return None
+        code = _gh_stderr_code(stderr_text)
+        logger.info('git clone failed (%s)', code)
+        _rmtree_quiet(dest)
+        return code
+    finally:
+        if home_dir is None:
+            _rmtree_quiet(home)
+
+
+def gh_extract_archive(zip_path, dest):
+    """Safely unpack a GitHub source archive into `dest`, dropping the single top-level folder. Same limits as a zip upload."""
+    os.makedirs(dest, exist_ok=True)
+    root_dir = os.path.realpath(dest)
+    with zipfile.ZipFile(zip_path, 'r') as archive:
+        items = archive.infolist()
+        if len(items) > MAX_ZIP_FILES:
+            raise GithubError('toobig', 'Repo mein files bahut zyada hain.')
+        if sum(max(0, i.file_size) for i in items) > GH_MAX_REPO_MB * 1024 * 1024:
+            raise GithubError('toobig', f'Repo {GH_MAX_REPO_MB} MB se bada hai.')
+        for item in items:
+            name = item.filename.replace('\\', '/')
+            parts = [p for p in name.split('/') if p]
+            if name.startswith('/') or '..' in parts or (len(name) > 1 and name[1] == ':'):
+                raise GithubError('fail', 'Archive mein unsafe path mila.')
+            if ((item.external_attr >> 16) & 0o170000) == 0o120000:
+                continue                                           # symlinks are simply not created
+            rel = '/'.join(parts[1:])                              # drop "<repo>-<branch>/"
+            if not rel or item.is_dir():
+                continue
+            target = os.path.realpath(os.path.join(root_dir, rel))
+            if os.path.commonpath((root_dir, target)) != root_dir:
+                raise GithubError('fail', 'Archive mein unsafe path mila.')
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with archive.open(item) as src, open(target, 'wb') as out:
+                shutil.copyfileobj(src, out, 1024 * 1024)
+
+
+def gh_fetch_archive(info, zip_path, timeout=None):
+    """Fallback when git is not installed: download the repo as a zip from GitHub's code archive host (https only, redirects
+    only to github.com / codeload.github.com, size and time limited). Raises GithubError. Needs the network, so never run in tests."""
+    timeout = GH_CLONE_TIMEOUT if timeout is None else timeout
+    if info.get('branch'):
+        url = f"https://github.com/{info['owner']}/{info['repo']}/archive/refs/heads/{info['branch']}.zip"
+    else:
+        url = f"https://github.com/{info['owner']}/{info['repo']}/archive/HEAD.zip"
+    deadline = time.time() + timeout
+    limit = GH_MAX_REPO_MB * 1024 * 1024
+    for _ in range(4):
+        parts = urlsplit(url)
+        if parts.scheme != 'https' or parts.hostname not in ('github.com', 'codeload.github.com'):
+            raise GithubError('fail', 'Download ka raasta safe nahi tha, roka gaya.')
+        try:
+            resp = requests.get(url, stream=True, allow_redirects=False, timeout=(10, 20), headers={'User-Agent': 'demon-hosting-bot'})
+        except requests.exceptions.RequestException:
+            raise GithubError('fail', 'GitHub se connect nahi ho paya.')
+        try:
+            if resp.status_code in (301, 302, 303, 307, 308):
+                url = urljoin(url, resp.headers.get('Location', ''))
+                continue
+            if resp.status_code in (404, 401, 403):
+                raise GithubError('notfound', '')
+            if resp.status_code != 200:
+                raise GithubError('fail', 'GitHub ne download nahi diya.')
+            size = 0
+            with open(zip_path, 'wb') as handle:
+                for block in resp.iter_content(1024 * 256):
+                    size += len(block)
+                    if size > limit:
+                        raise GithubError('toobig', '')
+                    if time.time() > deadline:
+                        raise GithubError('timeout', '')
+                    handle.write(block)
+            return
+        except requests.exceptions.RequestException:
+            raise GithubError('fail', 'Download beech mein ruk gaya.')
+        finally:
+            resp.close()
+    raise GithubError('fail', 'Bahut zyada redirect.')
+
+
+# ---- picking the important files ----------------------------------------------------------
+def _gh_rel_ok(rel):
+    parts = rel.split('/')
+    if len(parts) > 8:
+        return False
+    return all(GH_SEG_RE.fullmatch(p) or p in ('.env.example', '.env.sample', '.env.template') for p in parts)
+
+
+def gh_collect_files(root, subdir=None):
+    """Walk a cloned repo and pick the files worth hosting. Returns {'files': [(rel, abs, size)], 'skipped': {reason: count}}.
+    Raises GithubError for a symlink that points outside the repo, a source file the scanner could not read in full,
+    or a selection that is too big. Nothing is copied here."""
+    base = os.path.realpath(root)
+    if subdir:
+        base = os.path.realpath(os.path.join(base, *subdir.split('/')))
+        if os.path.commonpath((os.path.realpath(root), base)) != os.path.realpath(root) or not os.path.isdir(base):
+            raise GithubError('subdir', 'Ye folder repo mein nahi mila. Link ka /tree/branch/folder part check karo.')
+    skipped = {}
+    picked = []
+    total = 0
+    code_total = 0
+
+    def skip(reason):
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    for current, dirs, names in os.walk(base, followlinks=False):
+        keep_dirs = []
+        for d in sorted(dirs):
+            full = os.path.join(current, d)
+            if os.path.islink(full):
+                if os.path.commonpath((base, os.path.realpath(full))) != base:
+                    raise GithubError('symlink', 'Repo mein aisa shortcut (symlink) hai jo repo ke bahar jaata hai. Safety ke liye roka gaya.')
+                skip('symlink')
+                continue
+            if d.lower() in GH_SKIP_DIRS:
+                skip('junk folder')
+                continue
+            keep_dirs.append(d)
+        dirs[:] = keep_dirs
+        for name in sorted(names):
+            full = os.path.join(current, name)
+            rel = os.path.relpath(full, base).replace(os.sep, '/')
+            if os.path.islink(full):
+                if os.path.commonpath((base, os.path.realpath(full))) != base:
+                    raise GithubError('symlink', 'Repo mein aisa shortcut (symlink) hai jo repo ke bahar jaata hai. Safety ke liye roka gaya.')
+                skip('symlink')
+                continue
+            try:
+                size = os.lstat(full).st_size
+            except OSError:
+                continue
+            low = name.lower()
+            ext = os.path.splitext(low)[1]
+            if low.endswith(GH_PROTECTED_SUFFIXES) and low not in GH_INFO_NAMES:
+                skip('env/db file')
+                continue
+            if low in GH_INFO_NAMES:
+                kind = 'info'
+            elif ext in GH_CODE_EXTS:
+                kind = 'code'
+            elif ext in GH_DATA_EXTS:
+                kind = 'data'
+            elif ext in GH_ASSET_EXTS:
+                kind = 'asset'
+            else:
+                skip('other')
+                continue
+            if not _gh_rel_ok(rel):
+                skip('odd name')
+                continue
+            if kind == 'code':
+                if size > SCAN_MAX_SOURCE_BYTES:
+                    raise GithubError('bigcode', f'Code file `{rel}` bahut badi hai ({_human_size(size)}), scan nahi ho sakti.')
+                code_total += size
+            elif kind == 'data' and size > GH_MAX_DATA_KB * 1024:
+                skip('big data file')
+                continue
+            elif kind == 'asset' and size > GH_MAX_ASSET_KB * 1024:
+                skip('big image')
+                continue
+            elif kind == 'info' and size > GH_MAX_DATA_KB * 1024:
+                skip('big data file')
+                continue
+            total += size
+            picked.append((rel, full, size))
+            if len(picked) > GH_MAX_FILES:
+                raise GithubError('toobig', f'Zyada files hain (max {GH_MAX_FILES} important files).')
+            if total > GH_MAX_SELECTED_MB * 1024 * 1024:
+                raise GithubError('toobig', f'Important files ka total {GH_MAX_SELECTED_MB} MB se bada hai.')
+    if code_total > SCAN_MAX_ZIP_READ_BYTES - 1024 * 1024:
+        raise GithubError('bigcode', 'Code bahut bada hai, poora scan nahi ho sakta.')
+    return {'files': picked, 'skipped': skipped}
+
+
+GH_MAIN_ORDER = ('bot.py', 'main.py', 'app.py', 'index.js', 'bot.js', 'main.js')
+
+
+def gh_detect_main(files):
+    """files: list of (rel, abs, size). Returns an ordered list of runnable candidates found at the top level
+    (bot.py, main.py, app.py, index.js, bot.js, main.js, package.json start/main, Procfile worker:/web:)."""
+    rels = {rel for rel, _, _ in files}
+    top_code = {r for r in rels if '/' not in r and r.lower().endswith(GH_CODE_EXTS) and not r.lower().endswith(('.mjs', '.cjs'))}
+    found = []
+
+    def add(name):
+        name = (name or '').strip().lstrip('./')
+        if name in top_code and name not in found:
+            found.append(name)
+
+    for name in GH_MAIN_ORDER:
+        add(name)
+    by_rel = {rel: path for rel, path, _ in files}
+    if 'package.json' in by_rel:
+        try:
+            with open(by_rel['package.json'], 'r', encoding='utf-8', errors='ignore') as handle:
+                pkg = json.load(handle)
+            start = (pkg.get('scripts') or {}).get('start') if isinstance(pkg, dict) else None
+            if isinstance(start, str):
+                m = re.match(r'^\s*node\s+([A-Za-z0-9_./-]+\.js)\s*$', start)
+                if m:
+                    add(m.group(1))
+            main = pkg.get('main') if isinstance(pkg, dict) else None
+            if isinstance(main, str):
+                add(main)
+        except (OSError, ValueError):
+            pass
+    proc_key = next((r for r in rels if r.lower() == 'procfile'), None)
+    if proc_key:
+        try:
+            with open(by_rel[proc_key], 'r', encoding='utf-8', errors='ignore') as handle:
+                for line in handle.read(20000).splitlines():
+                    m = re.match(r'^\s*(?:worker|web)\s*:\s*(?:python3?|node)\s+([A-Za-z0-9_./-]+\.(?:py|js))\b', line)
+                    if m:
+                        add(m.group(1))
+        except OSError:
+            pass
+    return found
+
+
+def gh_main_choices(files):
+    """(candidates, fallback_used). Falls back to every top-level .py/.js when none of the usual names exists."""
+    found = gh_detect_main(files)
+    if found:
+        return found, False
+    others = sorted(r for r, _, _ in files if '/' not in r and r.lower().endswith(('.py', '.js')))
+    return others, True
+
+
+# ---- dependency files: only plain package names, no links, no install scripts --------------
+GH_REQ_LINE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9._,-]+\])?\s*((==|>=|<=|~=|!=|<|>|===)\s*[A-Za-z0-9*.+!_-]+\s*(,\s*(==|>=|<=|~=|!=|<|>)\s*[A-Za-z0-9*.+!_-]+\s*)*)?'
+                            r'(;\s*[A-Za-z0-9_.\s\'"<>=!~()]+)?$')
+
+
+def gh_clean_requirements(text):
+    """Keep only plain 'name [version]' lines. Options (-r, -e, --index-url ...), links, VCS and path requirements are dropped,
+    because they could pull code from anywhere. Returns (clean_text, dropped_count)."""
+    kept, dropped = [], 0
+    for line in text.splitlines():
+        stripped = line.split(' #', 1)[0].strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if GH_REQ_LINE_RE.fullmatch(stripped) and '://' not in stripped and '@' not in stripped:
+            kept.append(stripped)
+        else:
+            dropped += 1
+    return '\n'.join(kept) + ('\n' if kept else ''), dropped
+
+
+def gh_clean_package_json(raw):
+    """Drop dependencies that point at a link, git repo or local path (npm would fetch code from there). Returns (bytes, dropped_names)."""
+    try:
+        pkg = json.loads(raw.decode('utf-8-sig'))
+    except (ValueError, UnicodeDecodeError):
+        return raw, []
+    if not isinstance(pkg, dict):
+        return raw, []
+    dropped = []
+    for section in ('dependencies', 'optionalDependencies', 'devDependencies', 'peerDependencies'):
+        deps = pkg.get(section)
+        if not isinstance(deps, dict):
+            continue
+        for name in list(deps):
+            spec = str(deps[name]).strip().lower()
+            if (not re.fullmatch(r'[a-z0-9@/._~^<>=*|\s-]*', spec) or '/' in spec or spec.startswith(('git', 'file', 'link', 'http', 'github', 'npm:'))
+                    or not re.fullmatch(r'(@[a-z0-9._~-]+/)?[a-z0-9._~-]+', name.lower())):
+                dropped.append(name)
+                del deps[name]
+    if dropped:
+        return json.dumps(pkg, indent=2).encode('utf-8'), dropped
+    return raw, []
+
+
+def gh_lock_is_safe(raw):
+    """A package-lock.json is kept only when every download address in it is the normal npm registry."""
+    try:
+        for url in re.findall(rb'"resolved"\s*:\s*"([^"]*)"', raw):
+            if not url.startswith(b'https://registry.npmjs.org/'):
+                return False
+        return b'"git+' not in raw and b'"file:' not in raw
+    except Exception:
+        return False
+
+
+# ---- manifest + zip -------------------------------------------------------------------------
+def _gh_sign_key():
+    return hashlib.sha256(('github-manifest:' + BOT_TOKEN).encode()).digest()
+
+
+def gh_sign_manifest(manifest):
+    body = {k: v for k, v in manifest.items() if k != 'sig'}
+    data = json.dumps(body, sort_keys=True, separators=(',', ':')).encode()
+    return hmac.new(_gh_sign_key(), data, hashlib.sha256).hexdigest()
+
+
+def gh_manifest_valid(manifest):
+    """True only for a manifest made by this bot (a user's own zip cannot fake it)."""
+    try:
+        return (isinstance(manifest, dict) and isinstance(manifest.get('sig'), str)
+                and hmac.compare_digest(manifest['sig'], gh_sign_manifest(manifest))
+                and isinstance(manifest.get('repo'), str) and isinstance(manifest.get('main'), str))
+    except Exception:
+        return False
+
+
+def gh_build_zip(files, out_path, info, main_name, update=False, notes=None):
+    """Write the picked files (+ cleaned dependency files + signed manifest) into one zip. Returns the list of kept relative names."""
+    notes = notes if notes is not None else {}
+    kept = []
+    with zipfile.ZipFile(out_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+        for rel, path, _ in files:
+            low = rel.lower()
+            with open(path, 'rb') as handle:
+                raw = handle.read()
+            if low == 'requirements.txt':
+                clean, dropped = gh_clean_requirements(raw.decode('utf-8', 'ignore'))
+                if dropped:
+                    notes['req_dropped'] = dropped
+                raw = clean.encode()
+                if not raw.strip():
+                    continue
+            elif low == 'package.json':
+                raw, dropped_pkgs = gh_clean_package_json(raw)
+                if dropped_pkgs:
+                    notes['pkg_dropped'] = dropped_pkgs
+            elif low == 'package-lock.json' and not gh_lock_is_safe(raw):
+                notes['lock_dropped'] = True
+                continue
+            archive.writestr(rel, raw)
+            kept.append(rel)
+        manifest = {'v': 1, 'repo': info['url'], 'branch': info.get('branch') or '', 'subdir': info.get('subdir') or '',
+                    'main': main_name, 'update': bool(update), 'files': kept[:GH_MAX_FILES]}
+        manifest['sig'] = gh_sign_manifest(manifest)
+        archive.writestr(GH_MANIFEST_NAME, json.dumps(manifest))
+    return kept
+
+
+def gh_manifest_from_zip_bytes(data):
+    """The verified manifest of a zip held in memory / on disk, or None."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data) if isinstance(data, (bytes, bytearray)) else data) as archive:
+            info = archive.getinfo(GH_MANIFEST_NAME)
+            if info.file_size > 200000:
+                return None
+            manifest = json.loads(archive.read(info).decode('utf-8'))
+        return manifest if gh_manifest_valid(manifest) else None
+    except Exception:
+        return None
+
+
+def gh_take_manifest(extract_dir):
+    """Read and REMOVE the manifest from an extracted archive. Returns it only when the signature is ours."""
+    path = os.path.join(extract_dir, GH_MANIFEST_NAME)
+    if not os.path.isfile(path) or os.path.islink(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            manifest = json.loads(handle.read(300000))
+    except (OSError, ValueError):
+        manifest = None
+    _remove_quietly(path)          # never left behind in the user's storage, valid or not
+    if manifest is not None and gh_manifest_valid(manifest):
+        return manifest
+    return None
+
+
+# ---- sidecar (<bot file>.github.json inside the user's folder: travels with every backup) --------
+def gh_sidecar_path(user_folder, file_name):
+    base = bot_env_path(user_folder, file_name)
+    return None if base is None else os.path.join(user_folder, file_name + GH_SIDECAR_SUFFIX)
+
+
+def gh_write_sidecar(user_folder, file_name, manifest):
+    path = gh_sidecar_path(user_folder, file_name)
+    if path is None:
+        return False
+    body = {'repo': manifest['repo'], 'branch': manifest.get('branch', ''), 'subdir': manifest.get('subdir', ''),
+            'main': file_name, 'files': list(manifest.get('files', []))[:GH_MAX_FILES], 'updated': int(time.time())}
+    tmp = path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as handle:
+            json.dump(body, handle)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        logger.warning('Could not write GitHub info for %s: %s', file_name, exc)
+        _remove_quietly(tmp)
+        return False
+
+
+def gh_read_sidecar(user_folder, file_name):
+    """Stored source of a bot, re-validated (a restored backup could carry anything). Returns (info, data) or (None, None)."""
+    path = gh_sidecar_path(user_folder, file_name)
+    if path is None or not os.path.isfile(path) or os.path.islink(path):
+        return None, None
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = json.loads(handle.read(400000))
+        link = data['repo'] + ('/tree/' + data['branch'] + ('/' + data['subdir'] if data.get('subdir') else '') if data.get('branch') else '')
+        info = parse_github_url(link)
+        if not isinstance(data.get('files', []), list):
+            data['files'] = []
+        data['files'] = [f for f in data['files'] if isinstance(f, str)][:GH_MAX_FILES]
+        return info, data
+    except Exception:
+        return None, None
+
+
+# ---- running a deploy (clone -> pick files -> pack -> SAME scan / approval / zip deploy as a manual zip) -----------------
+def gh_begin(user_id):
+    """One GitHub deploy at a time per user. True when this user may start one."""
+    with GH_LOCK:
+        if user_id in GH_ACTIVE_USERS:
+            return False
+        GH_ACTIVE_USERS.add(user_id)
+        return True
+
+
+def gh_end(user_id):
+    with GH_LOCK:
+        GH_ACTIVE_USERS.discard(user_id)
+
+
+def _gh_say(ctx, text):
+    """Progress line: edit the status message (never raises)."""
+    try:
+        bot.edit_message_text(text, ctx['chat_id'], ctx['status_id'], parse_mode='HTML')
+    except Exception as exc:
+        logger.debug('GitHub status edit failed: %s', type(exc).__name__)
+
+
+def _gh_head(ctx):
+    kind = 'Update' if ctx.get('update') else 'Deploy'
+    return f"🐙 <b>GitHub {kind}</b> - <code>{html_escape(ctx['info']['owner'])}/{html_escape(ctx['info']['repo'])}</code>"
+
+
+def _gh_error_text(err):
+    """User-facing text for a GithubError (plain next step, no raw errors)."""
+    code = getattr(err, 'code', 'fail')
+    if code == 'notfound':
+        return ('Repo nahi mila, ya woh private hai. Abhi sirf PUBLIC repos chalte hain (token/password main nahi leta). '
+                'Link check karo, ya repo ko Public karke dobara try karo.')
+    if code == 'branch':
+        return 'Ye branch repo mein nahi mili. Link ka /tree/<branch> part check karo, ya branch ke bina sirf repo ka link do.'
+    if code == 'timeout':
+        return f'Download {GH_CLONE_TIMEOUT} second se zyada lag raha tha, isliye roka gaya. Thodi der baad dobara try karo.'
+    if code == 'toobig':
+        return f'Repo bahut bada hai (limit {GH_MAX_REPO_MB} MB). Chhota repo ya /tree/branch/folder wala link try karo.'
+    if code == 'nogit':
+        return 'Server par git nahi mila aur backup tareeka bhi nahi chala. Admin ko batao.'
+    if code == 'fail':
+        return 'GitHub se repo nahi aa paya (network ya link ki problem). Thodi der baad dobara try karo.'
+    return getattr(err, 'text', '') or 'Kuch gadbad ho gayi. Dobara try karo.'
+
+
+def gh_prepare(info, work_dir):
+    """Clone the repo into <work_dir>/repo (git first, GitHub's zip archive when git is not installed). Returns the folder
+    with the .git data removed. Raises GithubError."""
+    dest = os.path.join(work_dir, 'repo')
+    code = gh_clone(info['clone_url'], dest, info.get('branch'))
+    if code == 'nogit':
+        archive = os.path.join(work_dir, 'repo_archive.zip')
+        try:
+            gh_fetch_archive(info, archive)
+            gh_extract_archive(archive, dest)
+        finally:
+            _remove_quietly(archive)
+    elif code:
+        raise GithubError(code, '')
+    _rmtree_quiet(os.path.join(dest, '.git'))
+    return dest
+
+
+def _gh_top_clashes(user_id, files):
+    """Top-level names of the picked files that already exist in the user's storage."""
+    folder = get_user_folder(user_id)
+    known = {item[0] for item in user_files.get(user_id, [])}
+    tops = sorted({rel.split('/')[0] for rel, _, _ in files})
+    return [name for name in tops if name in known or os.path.lexists(os.path.join(folder, name))]
+
+
+def _gh_skip_summary(skipped):
+    if not skipped:
+        return ''
+    return ', '.join(f'{count} {reason}' for reason, count in sorted(skipped.items(), key=lambda kv: -kv[1])[:4])
+
+
+def _gh_cleanup(ctx):
+    _rmtree_quiet(ctx.get('work'))
+    gh_end(ctx['user_id'])
+
+
+def _gh_run(ctx):
+    """Whole deploy in a background thread. Cleans its temp folder in every case except while a picker is waiting."""
+    picking = False
+    slot = False
+    try:
+        if not GH_SLOTS.acquire(blocking=False):
+            _gh_say(ctx, f"{_gh_head(ctx)}\n⏳ Abhi {GH_GLOBAL_LIMIT} deploy chal rahe hain, server busy hai. 1-2 minute baad dobara try karo.")
+            return
+        slot = True
+        ctx['work'] = tempfile.mkdtemp(prefix=f"user_{ctx['user_id']}_gh_")
+        _gh_say(ctx, f"{_gh_head(ctx)}\n⏳ Repo clone ho raha hai (public repo, sirf padhne ke liye)...")
+        try:
+            repo_dir = gh_prepare(ctx['info'], ctx['work'])
+            _gh_say(ctx, f"{_gh_head(ctx)}\n📂 Important files chun raha hoon...")
+            picked = gh_collect_files(repo_dir, ctx['info'].get('subdir'))
+        except GithubError as err:
+            _gh_say(ctx, f"{_gh_head(ctx)}\n❌ {html_escape(_gh_error_text(err))}")
+            return
+        files = picked['files']
+        ctx['files'] = files
+        ctx['skipped'] = picked['skipped']
+        if not any(rel.lower().endswith(('.py', '.js')) for rel, _, _ in files):
+            _gh_say(ctx, f"{_gh_head(ctx)}\n❌ Is repo (ya folder) mein koi .py ya .js file nahi mili, to chalane layak kuch nahi hai.")
+            return
+        if ctx.get('update'):
+            if ctx['main'] not in {rel for rel, _, _ in files}:
+                _gh_say(ctx, f"{_gh_head(ctx)}\n❌ Update nahi hua: <code>{html_escape(ctx['main'])}</code> ab repo ke top par nahi mili. Purana version waise hi hai.")
+                return
+            main = ctx['main']
+        else:
+            candidates, fallback = gh_main_choices(files)
+            if not candidates:
+                _gh_say(ctx, f"{_gh_head(ctx)}\n❌ Main file nahi mili. Repo ke top par bot.py, main.py, app.py, index.js ya bot.js honi chahiye "
+                             "(ya /tree/branch/folder wala link do jahan wo file ho).")
+                return
+            clashes = _gh_top_clashes(ctx['user_id'], files)
+            if clashes:
+                shown = ', '.join(html_escape(c) for c in clashes[:6])
+                _gh_say(ctx, f"{_gh_head(ctx)}\n❌ Tumhari storage mein ye naam pehle se hain: <code>{shown}</code>. "
+                             "Pehle wali file delete ya rename karo, phir dobara try karo (kuch overwrite nahi kiya).")
+                return
+            if len(candidates) > 1:
+                picking = _gh_offer_pick(ctx, candidates[:9], fallback)
+                if picking:
                     return
-                pending_zip_files.setdefault(user_id, {})[file_name_zip] = downloaded_file_content
-                pending_zip_times[(user_id, file_name_zip)] = time.time()
-            
-            bot.reply_to(message, "⏳ File under security review. You will be notified upon approval.")
+                _gh_say(ctx, f"{_gh_head(ctx)}\n❌ Main file ki list nahi dikha paya. Dobara try karo.")
+                return
+            main = candidates[0]
+        _gh_finish(ctx, main)
+    except Exception:
+        logger.exception('GitHub deploy crashed for user %s', ctx.get('user_id'))
+        _gh_say(ctx, f"{_gh_head(ctx)}\n❌ Kuch gadbad ho gayi, kuch save nahi hua. Thodi der baad dobara try karo.")
+    finally:
+        if slot:
+            GH_SLOTS.release()
+        if not picking:
+            _gh_cleanup(ctx)
+
+
+def _gh_offer_pick(ctx, candidates, fallback):
+    """Several possible main files: ask which one runs. The clone stays in a temp folder until the user answers (or GH_PICK_TTL)."""
+    token = secrets.token_hex(4)
+    ctx['candidates'] = list(candidates)
+    ctx['created'] = time.time()
+    ctx['token'] = token
+    with GH_LOCK:
+        GH_PENDING[token] = ctx
+    keycaps = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣']
+    menu = NavMenu(row_width=1)
+    for index, name in enumerate(candidates):
+        menu.row(NavButton(f'{keycaps[index]} {name}', callback_data=f'ghp_{token}_{index}'))
+    menu.row(NavButton('❌ Cancel', callback_data=f'ghx_{token}'))
+    why = 'Usual naam nahi mila, ye .py/.js files top par hain' if fallback else 'Kai main file mil gayi'
+    text = f"{_gh_head(ctx)}\n🤔 {why}. Kaun si file chalani hai? Number dabao:"
+    try:
+        bot.edit_message_text(text, ctx['chat_id'], ctx['status_id'], parse_mode='HTML')
+    except Exception as exc:
+        logger.debug('GitHub picker edit failed: %s', type(exc).__name__)
+    sent = _safe_send(ctx['chat_id'], f'Main file chuno (ye {GH_PICK_TTL // 60} minute tak rukega) 👇', reply_markup=menu)
+    if sent is None:
+        with GH_LOCK:
+            GH_PENDING.pop(token, None)
+        return False
+    timer = threading.Timer(GH_PICK_TTL + 5, _gh_expire_token, args=(token,))
+    timer.daemon = True
+    timer.start()
+    return True
+
+
+def _gh_expire_token(token):
+    with GH_LOCK:
+        ctx = GH_PENDING.pop(token, None)
+    if ctx is not None:
+        _gh_say(ctx, f"{_gh_head(ctx)}\n⌛ Main file chuni nahi gayi, isliye deploy cancel ho gaya. Dobara Upload se shuru karo.")
+        _gh_cleanup(ctx)
+
+
+def _gh_cancel_user(user_id):
+    """Cancel pressed: drop any 'pick the main file' list this user left open."""
+    with GH_LOCK:
+        tokens = [t for t, c in GH_PENDING.items() if c['user_id'] == user_id or c['actor_id'] == user_id]
+        dropped = [GH_PENDING.pop(t) for t in tokens]
+    for ctx in dropped:
+        _gh_say(ctx, f"{_gh_head(ctx)}\n❎ Cancel ho gaya, kuch save nahi hua.")
+        _gh_cleanup(ctx)
+
+
+def _gh_resume(ctx, main):
+    """After the user picked the main file."""
+    slot = False
+    try:
+        slot = GH_SLOTS.acquire(timeout=60)
+        if not slot:
+            _gh_say(ctx, f"{_gh_head(ctx)}\n⏳ Server busy hai, kuch save nahi hua. Thodi der baad dobara try karo.")
+            return
+        _gh_finish(ctx, main)
+    except Exception:
+        logger.exception('GitHub deploy (after pick) crashed for user %s', ctx.get('user_id'))
+        _gh_say(ctx, f"{_gh_head(ctx)}\n❌ Kuch gadbad ho gayi, kuch save nahi hua. Thodi der baad dobara try karo.")
+    finally:
+        if slot:
+            GH_SLOTS.release()
+        _gh_cleanup(ctx)
+
+
+def _gh_finish(ctx, main):
+    """Pack the picked files, then hand the zip to the same scan / approval / deploy path as a manual zip upload."""
+    user_id, chat_id, info = ctx['user_id'], ctx['chat_id'], ctx['info']
+    files = ctx['files']
+    label = f"{info['owner']}/{info['repo']}"
+    zip_name = f"{info['repo']}-update.zip" if ctx.get('update') else f"{info['repo']}.zip"
+    zip_path = os.path.join(ctx['work'], 'pack.zip')
+    notes = {}
+    try:
+        kept = gh_build_zip(files, zip_path, info, main, update=bool(ctx.get('update')), notes=notes)
+        with open(zip_path, 'rb') as handle:
+            data = handle.read()
+    except GithubError as err:
+        _gh_say(ctx, f"{_gh_head(ctx)}\n❌ {html_escape(_gh_error_text(err))}")
+        return
+    total = sum(size for _, _, size in files)
+    lines = [_gh_head(ctx), f"✅ {len(kept)} important files li ({_human_size(total)}). Main: <code>{html_escape(main)}</code>"]
+    skip_text = _gh_skip_summary(ctx.get('skipped'))
+    if skip_text:
+        lines.append(f"↪️ Skip: {html_escape(skip_text)}")
+    if notes.get('req_dropped'):
+        lines.append(f"⚠️ requirements.txt ki {notes['req_dropped']} line(s) hatayi (link/option wali, safety ke liye).")
+    if notes.get('pkg_dropped'):
+        lines.append(f"⚠️ package.json ki ye dependencies hatayi (link/git wali): {html_escape(', '.join(notes['pkg_dropped'][:5]))}")
+    if notes.get('lock_dropped'):
+        lines.append('⚠️ package-lock.json hata di (registry ke bahar ke links the).')
+    lines.append('🛡 Security scan chal raha hai...')
+    _gh_say(ctx, '\n'.join(lines))
+
+    is_admin = user_id in admin_ids      # an admin pressing Update on someone else's bot does NOT skip that owner's scan
+    reply_obj = _ReplyTarget(chat_id, ctx['status_id'], user_id)
+    if is_admin:
+        result = _build_result([], zip_name, 'zip', len(data))
+        result['sha256'] = hashlib.sha256(data).hexdigest()
+        decision = 'admin'
+    else:
+        result = _scan_upload(data, '.zip', zip_name)
+        decision = 'auto'
+    level = result['level']
+    logger.info('GitHub scan: user=%s repo=%s level=%s update=%s', user_id, label, level, bool(ctx.get('update')))
+    head = '\n'.join(lines[:-1])
+
+    def verdict(outcome):
+        text = _user_verdict_text(result, label, outcome)
+        if outcome == 'rejected':
+            text += '\nKuch save ya start nahi hua.'
+        elif outcome == 'review' and ctx.get('update'):
+            text += '\nPurana version waise hi chalta rahega.'
+        _gh_say(ctx, f"{head}\n{text}")
+
+    if not is_admin and level == THREAT_HIGH:
+        verdict('rejected')
+        notice = (f"🔴 GitHub deploy reject hua: <code>{html_escape(info['url'])}</code> from {html_escape(ctx['uploader'])} "
+                  f"(<code>{user_id}</code>)\n{_reason_lines_html(result, 2)}")
+        for admin_id in sorted(admin_ids):
+            _safe_send(admin_id, notice)
+        return
+    if not is_admin and level == THREAT_MEDIUM:
+        token, err = _submit_for_review(user_id, ctx['uploader'], chat_id, ctx['status_id'], zip_name, 'zip', data, result)
+        if token:
+            verdict('review')
+        else:
+            _gh_say(ctx, f"{head}\n{THREAT_BADGE[level]} Start nahi hua. {html_escape(err)}")
+        return
+    if is_admin:
+        _gh_say(ctx, f"{head}\n🛡 Admin deploy - seedha chal raha hai (scan record ke saath).")
+    else:
+        verdict('auto')
+    ok, err = _deploy_upload(user_id, zip_name, 'zip', data, reply_obj, result, decision)
+    if not ok and err:
+        _safe_send(chat_id, f'⚠️ {html_escape(err)}')
+
+
+# ---- link prompt, picker answers, update button ------------------------------------------------------------------------
+def _gh_upload_menu():
+    menu = NavMenu(row_width=1)
+    menu.row(NavButton('🐙 Deploy from GitHub', callback_data='gh_start'))
+    menu.row(NavButton('📤 Manual Upload', callback_data='gh_manual'))
+    menu.row(NavButton('❌ Cancel', callback_data='nav_cancel'))
+    return menu
+
+
+UPLOAD_CHOICE_TEXT = ("📤 <b>Upload kaise karna hai?</b>\n\n"
+                      "🐙 <b>Deploy from GitHub</b> - apne public GitHub repo ka link do, main important files clone karke chala dunga.\n"
+                      "📤 <b>Manual Upload</b> - apni .py, .js ya .zip file khud bhejo.")
+
+
+def _send_upload_choice(chat_id):
+    bot.send_message(chat_id, UPLOAD_CHOICE_TEXT, parse_mode='HTML', reply_markup=_gh_upload_menu())
+
+
+def _upload_limit_ok(user_id, chat_id):
+    file_limit = get_user_file_limit(user_id)
+    current_files = get_user_file_count(user_id)
+    if current_files >= file_limit:
+        limit_str = str(file_limit) if file_limit != float('inf') else 'Unlimited'
+        bot.send_message(chat_id, f"⚠️ File limit ({current_files}/{limit_str}) reached. Purani file delete karo, ya backup export/import karo.",
+                         reply_markup=_files_view(user_id)[1])
+        return False
+    return True
+
+
+def gh_manual_callback(call):
+    bot.answer_callback_query(call.id)
+    if _upload_limit_ok(call.from_user.id, call.message.chat.id):
+        bot.send_message(call.message.chat.id, "📤 Send your Python (`.py`), JS (`.js`), or ZIP (`.zip`) file.")
+
+
+def gh_start_callback(call):
+    bot.answer_callback_query(call.id)
+    user_id, chat_id = call.from_user.id, call.message.chat.id
+    if not _upload_limit_ok(user_id, chat_id):
+        return
+    with GH_LOCK:
+        busy = user_id in GH_ACTIVE_USERS
+    if busy:
+        bot.send_message(chat_id, '⏳ Tumhara ek GitHub deploy abhi chal raha hai (ya main file ka intezaar hai). Pehle use khatam hone do.')
+        return
+    prompt = ("🐙 <b>Deploy from GitHub</b>\n\nApne <b>public</b> repo ka link bhejo, jaise:\n"
+              "<code>https://github.com/owner/repo</code>\n"
+              "Branch/folder ke liye: <code>https://github.com/owner/repo/tree/main/folder</code>\n\n"
+              "Private repo abhi support nahi hai, aur main koi token/password nahi maangta.")
+    sent = bot.send_message(chat_id, prompt, parse_mode='HTML', reply_markup=NavMenu().add(NavButton('❌ Cancel', callback_data='nav_cancel')))
+    bot.register_next_step_handler(sent, _gh_receive_link, user_id)
+
+
+def _gh_receive_link(message, actor_id):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    text = getattr(message, 'text', None)
+    if user_id != actor_id or not text:
+        sent = bot.send_message(chat_id, '⚠️ Link text mein bhejo, jaise https://github.com/owner/repo')
+        bot.register_next_step_handler(sent, _gh_receive_link, actor_id)
+        return
+    try:
+        info = parse_github_url(text)
+    except GithubError as err:
+        sent = bot.send_message(chat_id, f"⚠️ {err.text}\nDobara link bhejo, ya Cancel dabao.")
+        bot.register_next_step_handler(sent, _gh_receive_link, actor_id)
+        return
+    if is_user_banned(user_id) or (bot_locked and user_id not in admin_ids):
+        bot.send_message(chat_id, '⚠️ Abhi deploy nahi ho sakta.')
+        return
+    if not _upload_limit_ok(user_id, chat_id):
+        return
+    if not gh_begin(user_id):
+        bot.send_message(chat_id, '⏳ Tumhara ek GitHub deploy abhi chal raha hai. Pehle use khatam hone do.')
+        return
+    try:
+        status = bot.send_message(chat_id, f"🐙 <b>GitHub Deploy</b> - <code>{html_escape(info['owner'])}/{html_escape(info['repo'])}</code>\n⏳ Shuru ho raha hai...",
+                                  parse_mode='HTML')
+    except Exception:
+        gh_end(user_id)
+        raise
+    uploader = message.from_user.first_name or message.from_user.username or str(user_id)
+    ctx = {'user_id': user_id, 'actor_id': user_id, 'chat_id': chat_id, 'status_id': status.message_id, 'info': info,
+           'update': False, 'uploader': uploader, 'work': None}
+    threading.Thread(target=_gh_run, args=(ctx,), daemon=True).start()
+
+
+def gh_pick_callback(call):
+    """ghp_<token>_<index> = chosen main file, ghx_<token> = cancel."""
+    parts = call.data.split('_')
+    token = parts[1] if len(parts) > 1 else ''
+    with GH_LOCK:
+        ctx = GH_PENDING.get(token)
+        allowed = ctx is not None and call.from_user.id in (ctx['actor_id'], ctx['user_id'])
+        if allowed:
+            GH_PENDING.pop(token, None)
+    if ctx is None or not allowed:
+        bot.answer_callback_query(call.id, 'Ye list purani ho gayi. Upload se dobara shuru karo.', show_alert=True)
+        return
+    if parts[0] == 'ghx':
+        bot.answer_callback_query(call.id, 'Cancel ho gaya.')
+        _gh_say(ctx, f"{_gh_head(ctx)}\n❎ Cancel ho gaya, kuch save nahi hua.")
+        _gh_cleanup(ctx)
+        return
+    try:
+        main = ctx['candidates'][int(parts[2])]
+    except (IndexError, ValueError):
+        bot.answer_callback_query(call.id, 'Galat choice.', show_alert=True)
+        _gh_cleanup(ctx)
+        return
+    bot.answer_callback_query(call.id, f'{main} chuni.')
+    threading.Thread(target=_gh_resume, args=(ctx, main), daemon=True).start()
+
+
+def gh_update_callback(call):
+    """ghu_<ownerid>_<file>: pull the repo again; restart only if the scan passes."""
+    try:
+        _, owner_str, file_name = call.data.split('_', 2)
+        owner_id = int(owner_str)
+    except (ValueError, IndexError):
+        bot.answer_callback_query(call.id, 'Galat button.', show_alert=True)
+        return
+    actor = call.from_user.id
+    if not (actor == owner_id or actor in admin_ids):
+        bot.answer_callback_query(call.id, '⚠️ Permission denied.', show_alert=True)
+        return
+    if not any(item[0] == file_name for item in user_files.get(owner_id, [])):
+        bot.answer_callback_query(call.id, '⚠️ File not found.', show_alert=True)
+        return
+    info, side = gh_read_sidecar(get_user_folder(owner_id), file_name)
+    if info is None:
+        bot.answer_callback_query(call.id, 'Is bot ka GitHub source yaad nahi hai.', show_alert=True)
+        return
+    if not gh_begin(owner_id):
+        bot.answer_callback_query(call.id, 'Ek GitHub deploy pehle se chal raha hai.', show_alert=True)
+        return
+    bot.answer_callback_query(call.id, 'Update shuru...')
+    chat_id = call.message.chat.id
+    try:
+        status = bot.send_message(chat_id, f"🐙 <b>GitHub Update</b> - <code>{html_escape(info['owner'])}/{html_escape(info['repo'])}</code>\n⏳ Shuru ho raha hai...",
+                                  parse_mode='HTML')
+    except Exception:
+        gh_end(owner_id)
+        raise
+    uploader = call.from_user.first_name or call.from_user.username or str(actor)
+    ctx = {'user_id': owner_id, 'actor_id': actor, 'chat_id': chat_id, 'status_id': status.message_id, 'info': info,
+           'update': True, 'main': file_name, 'uploader': uploader, 'work': None}
+    threading.Thread(target=_gh_run, args=(ctx,), daemon=True).start()
+
+
+# ---- applying an update to an already hosted bot ------------------------------------------------------------------------
+def _gh_apply_update(extract_dir, manifest, user_id, user_folder, message, scan, state):
+    """Update branch of the zip deploy. Only code files the earlier GitHub deploy put there are overwritten;
+    .env / .db / .sqlite files, data files and anything else of the user stay untouched. If anything fails the old files
+    are put back. The bot is restarted only after everything worked (the scan already passed to get here)."""
+    main = manifest['main']
+    info, side = gh_read_sidecar(user_folder, main)
+    entry = next((item for item in user_files.get(user_id, []) if item[0] == main), None)
+    if info is None or info['url'] != manifest.get('repo') or entry is None or not os.path.isfile(os.path.join(user_folder, main)):
+        bot.reply_to(message, '❌ Update nahi hua: is bot ka GitHub source ya file ab maujood nahi hai. Purana version waise hi hai.')
+        return
+    file_type = entry[1]
+    known = set(side.get('files') or [])
+    root_real = os.path.realpath(user_folder)
+    plan, kept_count = [], 0
+    for base, dirs, names in os.walk(extract_dir):
+        for name in names:
+            src = os.path.join(base, name)
+            rel = os.path.relpath(src, extract_dir).replace(os.sep, '/')
+            low = rel.lower()
+            leaf = os.path.basename(low)
+            if os.path.islink(src) or not _gh_rel_ok(rel):
+                continue
+            if low.endswith(GH_PROTECTED_SUFFIXES) and leaf not in GH_INFO_NAMES:
+                kept_count += 1
+                continue
+            dest = os.path.join(user_folder, *rel.split('/'))
+            real = os.path.realpath(dest)
+            if os.path.commonpath((root_real, real)) != root_real or real != os.path.join(os.path.realpath(os.path.dirname(dest)), os.path.basename(dest)):
+                continue
+            if os.path.lexists(dest):
+                is_code = low.endswith(GH_UPDATE_CODE_EXTS) or leaf in GH_UPDATE_CODE_NAMES
+                if os.path.isfile(dest) and not os.path.islink(dest) and rel in known and is_code:
+                    plan.append((rel, src, dest, 'update'))
+                else:
+                    kept_count += 1
+            else:
+                plan.append((rel, src, dest, 'new'))
+    if main not in {rel for rel, _, _, _ in plan}:
+        bot.reply_to(message, '❌ Update nahi hua: main file update list mein nahi aayi. Purana version waise hi hai.')
+        return
+    if os.path.isfile(os.path.join(extract_dir, 'requirements.txt')):
+        if not _install_zip_deps(extract_dir, message, user_id, safe=True, do_npm=False):
+            return
+    backup_dir = os.path.join(os.path.dirname(extract_dir), 'update_backup')
+    os.makedirs(backup_dir, exist_ok=True)
+    touched = []          # (rel, dest, action)
+
+    def rollback():
+        for rel, dest, action in reversed(touched):
+            try:
+                if action == 'new':
+                    _remove_quietly(dest)
+                else:
+                    shutil.copyfile(os.path.join(backup_dir, *rel.split('/')), dest)
+            except OSError as exc:
+                logger.error('GitHub update rollback failed for %s: %s', rel, exc)
+
+    try:
+        for rel, src, dest, action in plan:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if action == 'update':
+                backup = os.path.join(backup_dir, *rel.split('/'))
+                os.makedirs(os.path.dirname(backup), exist_ok=True)
+                shutil.copyfile(dest, backup)
+            tmp = dest + '.ghtmp'
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dest)
+            touched.append((rel, dest, action))
+    except OSError as exc:
+        logger.error('GitHub update copy failed: %s', exc)
+        rollback()
+        bot.reply_to(message, '❌ Update ke beech file likhne mein dikkat aayi. Purani files wapas rakh di, kuch nahi badla.')
+        return
+    if any(rel == 'package.json' for rel, _, _ in touched):
+        if not _install_zip_deps(user_folder, message, user_id, safe=True, do_pip=False):
+            rollback()
+            bot.reply_to(message, '↩️ Update wapas le liya, purani files waise hi hain.')
             return
 
-        # Process ZIP file if safe
-        process_zip_file(zip_path, user_id, user_folder, file_name_zip, message, temp_dir)
-        
-    except zipfile.BadZipFile as e:
-        logger.error(f"Bad zip file from {user_id}: {e}")
-        bot.reply_to(message, f"❌ Error: Invalid/corrupted ZIP. {e}")
-    except Exception as e:
-        logger.error(f"❌ Error processing zip for {user_id}: {e}", exc_info=True)
-        bot.reply_to(message, f"❌ Error processing zip: {str(e)}")
-    finally:
-        if temp_dir and os.path.exists(temp_dir):
-            try: shutil.rmtree(temp_dir); logger.info(f"Cleaned temp dir: {temp_dir}")
-            except Exception as e: logger.error(f"Failed to clean temp dir {temp_dir}: {e}", exc_info=True)
+    script_key = _script_key(user_id, main)
+    RESTART_STATE.setdefault(script_key, {'attempts': 0, 'manual_stop': False})['manual_stop'] = True
+    if is_bot_running(user_id, main):
+        process_info = bot_scripts.get(script_key)
+        if process_info:
+            kill_process_tree(process_info)
+        _forget_script(script_key)
+        time.sleep(1.5)
+    _reset_restart_state(user_id, main)
+    main_path = os.path.join(user_folder, main)
+    if scan:
+        record = dict(scan[0])
+        record['sha256'] = _file_sha256(main_path) or record.get('sha256', '')
+        save_scan_record(user_id, main, record, scan[1])
+    gh_write_sidecar(user_folder, main, manifest)
+    state['ok'] = True
+    updated = sum(1 for _, _, _, action in plan if action == 'update')
+    added = len(plan) - updated
+    bot.reply_to(message, f"✅ Update ho gaya: {updated} file badli, {added} nayi, {kept_count} waise hi chhodi (.env/data/db). "
+                          f"Ab <code>{html_escape(main)}</code> restart ho raha hai...", parse_mode='HTML')
+    target = run_js_script if file_type == 'js' else run_script
+    threading.Thread(target=target, args=(main_path, user_id, user_folder, main, message)).start()
+
+
+# ---- what the admin sees for a held GitHub deploy ---------------------------------------------------------------------
+def _gh_source_line(manifest):
+    if not manifest:
+        return ''
+    kind = 'update' if manifest.get('update') else 'deploy'
+    return f"🐙 GitHub {kind}: <code>{html_escape(str(manifest.get('repo', '')))}</code>"
+
+
+def _review_source(entry):
+    """Source line for a held upload that came from GitHub (read from the signed manifest inside the held zip)."""
+    try:
+        if entry.get('kind') != 'upload' or entry.get('file_type') != 'zip':
+            return ''
+        return _gh_source_line(gh_manifest_from_zip_bytes(_quarantine_path(entry['token'])))
+    except Exception:
+        return ''
+
+
+
+def _install_zip_deps(folder, message, user_id, safe=False, do_pip=True, do_npm=True):
+    """Install requirements.txt / package.json found in `folder` (same behaviour as before for manual zips).
+    safe=True (GitHub deploys): npm runs with --ignore-scripts so no repo install hook is executed.
+    Returns False when something failed (the user was told why)."""
+    req_path = os.path.join(folder, 'requirements.txt')
+    if do_pip and os.path.isfile(req_path):
+        req_file = 'requirements.txt'
+        logger.info(f"requirements.txt found, installing: {req_path}")
+        bot.reply_to(message, f"🔄 Installing Python deps from `{req_file}`...")
+        try:
+            command = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '-r', req_path]
+            result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore',
+                                    timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=child_env())
+            logger.info(f"pip install from requirements.txt OK. Output:\n{result.stdout}")
+            bot.reply_to(message, f"✅ Python deps from `{req_file}` installed.")
+        except subprocess.CalledProcessError as e:
+            log_tail = _short_code_block((e.stderr or e.stdout or '')[-2500:], 2500)
+            error_msg = f"❌ Failed to install Python deps from `{req_file}`.\nLog:\n```\n{log_tail}\n```"
+            logger.error(error_msg)
+            bot.reply_to(message, error_msg, parse_mode='Markdown'); return False
+        except subprocess.TimeoutExpired:
+            logger.error(f"pip install -r timed out for user {user_id}")
+            bot.reply_to(message, f"❌ Installing the Python deps took longer than {INSTALL_TIMEOUT} seconds and was stopped."); return False
+        except Exception as e:
+            error_msg = f"❌ Unexpected error installing Python deps: {e}"
+            logger.error(error_msg, exc_info=True); bot.reply_to(message, error_msg); return False
+
+    pkg_json = 'package.json'
+    if do_npm and os.path.isfile(os.path.join(folder, pkg_json)):
+        logger.info(f"package.json found, npm install in: {folder}")
+        bot.reply_to(message, f"🔄 Installing Node deps from `{pkg_json}`...")
+        try:
+            command = ['npm', 'install', '--ignore-scripts'] if safe else ['npm', 'install']
+            result = subprocess.run(command, capture_output=True, text=True, check=True, cwd=folder, encoding='utf-8', errors='ignore',
+                                    timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=child_env())
+            logger.info(f"npm install OK. Output:\n{result.stdout}")
+            bot.reply_to(message, f"✅ Node deps from `{pkg_json}` installed.")
+        except FileNotFoundError:
+            bot.reply_to(message, "❌ 'npm' not found. Cannot install Node deps."); return False
+        except subprocess.CalledProcessError as e:
+            log_tail = _short_code_block((e.stderr or e.stdout or '')[-2500:], 2500)
+            error_msg = f"❌ Failed to install Node deps from `{pkg_json}`.\nLog:\n```\n{log_tail}\n```"
+            logger.error(error_msg)
+            bot.reply_to(message, error_msg, parse_mode='Markdown'); return False
+        except subprocess.TimeoutExpired:
+            logger.error(f"npm install timed out for user {user_id}")
+            bot.reply_to(message, f"❌ Installing the Node deps took longer than {INSTALL_TIMEOUT} seconds and was stopped."); return False
+        except Exception as e:
+            error_msg = f"❌ Unexpected error installing Node deps: {e}"
+            logger.error(error_msg, exc_info=True); bot.reply_to(message, error_msg); return False
+    return True
+
 
 def process_zip_file(zip_path, user_id, user_folder, file_name_zip, message, temp_dir=None, scan=None):
     """Process ZIP file extraction and setup. Returns True when the archive was set up and its main script started.
@@ -4393,56 +5194,20 @@ def _process_zip_file_impl(zip_path, user_id, user_folder, file_name_zip, messag
             zip_ref.extractall(extract_dir)
             logger.info(f"Extracted zip to {extract_dir}")
 
+        # A zip packed by the GitHub deploy carries a signed manifest (a manual zip cannot fake it; it is removed here).
+        manifest = gh_take_manifest(extract_dir)
+        if manifest and manifest.get('update'):
+            _gh_apply_update(extract_dir, manifest, user_id, user_folder, message, scan, state)
+            return
+
         extracted_items = os.listdir(extract_dir)
         py_files = [f for f in extracted_items if f.endswith('.py')]
         js_files = [f for f in extracted_items if f.endswith('.js')]
         req_file = 'requirements.txt' if 'requirements.txt' in extracted_items else None
         pkg_json = 'package.json' if 'package.json' in extracted_items else None
 
-        if req_file:
-            req_path = os.path.join(extract_dir, req_file)
-            logger.info(f"requirements.txt found, installing: {req_path}")
-            bot.reply_to(message, f"🔄 Installing Python deps from `{req_file}`...")
-            try:
-                command = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '-r', req_path]
-                result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore',
-                                        timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=child_env())
-                logger.info(f"pip install from requirements.txt OK. Output:\n{result.stdout}")
-                bot.reply_to(message, f"✅ Python deps from `{req_file}` installed.")
-            except subprocess.CalledProcessError as e:
-                log_tail = _short_code_block((e.stderr or e.stdout or '')[-2500:], 2500)
-                error_msg = f"❌ Failed to install Python deps from `{req_file}`.\nLog:\n```\n{log_tail}\n```"
-                logger.error(error_msg)
-                bot.reply_to(message, error_msg, parse_mode='Markdown'); return
-            except subprocess.TimeoutExpired:
-                logger.error(f"pip install -r timed out for user {user_id}")
-                bot.reply_to(message, f"❌ Installing the Python deps took longer than {INSTALL_TIMEOUT} seconds and was stopped."); return
-            except Exception as e:
-                 error_msg = f"❌ Unexpected error installing Python deps: {e}"
-                 logger.error(error_msg, exc_info=True); bot.reply_to(message, error_msg); return
-
-        if pkg_json:
-            logger.info(f"package.json found, npm install in: {extract_dir}")
-            bot.reply_to(message, f"🔄 Installing Node deps from `{pkg_json}`...")
-            try:
-                command = ['npm', 'install']
-                result = subprocess.run(command, capture_output=True, text=True, check=True, cwd=extract_dir, encoding='utf-8', errors='ignore',
-                                        timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=child_env())
-                logger.info(f"npm install OK. Output:\n{result.stdout}")
-                bot.reply_to(message, f"✅ Node deps from `{pkg_json}` installed.")
-            except FileNotFoundError:
-                bot.reply_to(message, "❌ 'npm' not found. Cannot install Node deps."); return 
-            except subprocess.CalledProcessError as e:
-                log_tail = _short_code_block((e.stderr or e.stdout or '')[-2500:], 2500)
-                error_msg = f"❌ Failed to install Node deps from `{pkg_json}`.\nLog:\n```\n{log_tail}\n```"
-                logger.error(error_msg)
-                bot.reply_to(message, error_msg, parse_mode='Markdown'); return
-            except subprocess.TimeoutExpired:
-                logger.error(f"npm install timed out for user {user_id}")
-                bot.reply_to(message, f"❌ Installing the Node deps took longer than {INSTALL_TIMEOUT} seconds and was stopped."); return
-            except Exception as e:
-                 error_msg = f"❌ Unexpected error installing Node deps: {e}"
-                 logger.error(error_msg, exc_info=True); bot.reply_to(message, error_msg); return
+        if not _install_zip_deps(extract_dir, message, user_id, safe=bool(manifest)):
+            return
 
         main_script_name = None; file_type = None
         preferred_py = ['main.py', 'bot.py', 'app.py']; preferred_js = ['index.js', 'main.js', 'bot.js', 'app.js']
@@ -4454,6 +5219,10 @@ def _process_zip_file_impl(zip_path, user_id, user_folder, file_name_zip, messag
         if not main_script_name:
             if py_files: main_script_name = py_files[0]; file_type = 'py'
             elif js_files: main_script_name = js_files[0]; file_type = 'js'
+        if manifest:
+            wanted = str(manifest.get('main', ''))
+            if wanted in extracted_items and wanted.endswith(('.py', '.js')):
+                main_script_name = wanted; file_type = 'js' if wanted.endswith('.js') else 'py'
         if not main_script_name:
             bot.reply_to(message, "❌ No `.py` or `.js` script found in archive!"); return
 
@@ -4479,7 +5248,11 @@ def _process_zip_file_impl(zip_path, user_id, user_folder, file_name_zip, messag
             scan_record['sha256'] = _file_sha256(main_script_path) or scan_record.get('sha256', '')
             save_scan_record(user_id, main_script_name, scan_record, scan[1])
         state['ok'] = True
-        bot.reply_to(message, f"✅ Files extracted. Starting main script: `{main_script_name}`...", parse_mode='Markdown')
+        if manifest:
+            gh_write_sidecar(user_folder, main_script_name, manifest)
+            bot.reply_to(message, f"✅ GitHub repo se files lag gayi. Starting main script: `{main_script_name}`...\n🐙 Source: {manifest.get('repo', '')}")
+        else:
+            bot.reply_to(message, f"✅ Files extracted. Starting main script: `{main_script_name}`...", parse_mode='Markdown')
 
         # Use user_id as script_owner_id for script key context
         if file_type == 'py':
@@ -5103,23 +5876,13 @@ def _logic_send_welcome(message):
                         f"🚀 Host Python and JavaScript scripts, manage processes, inspect logs, and monitor your bots.\n\n"
                         f"<i>Select an option from the control panel below.</i>")
     try:
-        # ReplyKeyboardMarkup and InlineKeyboardMarkup cannot be attached to the
-        # same Telegram message, so send the persistent keyboard with the
-        # welcome message and the inline quick-actions panel as a second message.
-        bot.send_message(
-            chat_id, welcome_msg_text,
-            reply_markup=create_reply_main_menu(user_id), parse_mode='HTML'
-        )
-        bot.send_message(
-            chat_id, '<b>⚡ QUICK ACTIONS</b>\nSelect an action below:',
-            reply_markup=create_main_menu_inline(user_id), parse_mode='HTML'
-        )
+        bot.send_message(chat_id, welcome_msg_text, reply_markup=create_main_menu_inline(user_id), parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error sending welcome to {user_id}: {e}", exc_info=True)
 
 def _logic_updates_channel(message):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton('📢 Updates Channel', url=f'https://t.me/{UPDATE_CHANNEL.replace("@", "")}'))
+    markup = NavMenu()
+    markup.add(NavButton('📢 Updates Channel', url=f'https://t.me/{UPDATE_CHANNEL.replace("@", "")}'))
     bot.reply_to(message, "Visit our Updates Channel:", reply_markup=markup)
 
 def _logic_upload_file(message):
@@ -5145,9 +5908,9 @@ def _logic_upload_file(message):
     current_files = get_user_file_count(user_id)
     if current_files >= file_limit:
         limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
-        bot.reply_to(message, f"⚠️ File limit ({current_files}/{limit_str}) reached. Delete files first.")
+        bot.reply_to(message, f"⚠️ File limit ({current_files}/{limit_str}) reached. Purani file delete karo, ya backup export/import karo.", reply_markup=_files_view(user_id)[1])
         return
-    bot.reply_to(message, "📤 Send your Python (`.py`), JS (`.js`), or ZIP (`.zip`) file.")
+    _send_upload_choice(message.chat.id)
 
 def _logic_check_files(message):
     user_id = message.from_user.id
@@ -5164,20 +5927,8 @@ def _logic_check_files(message):
         bot.reply_to(message, subscription_message, reply_markup=markup, parse_mode='HTML')
         return
         
-    user_files_list = user_files.get(user_id, [])
-    if not user_files_list:
-        bot.reply_to(message, "📂 Your files:\n\n(No files uploaded yet)")
-        return
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    scan_map = get_scan_map(user_id)
-    for file_name, file_type in sorted(user_files_list):
-        is_running = is_bot_running(user_id, file_name) # Use user_id for checking status
-        status_icon = "🟢 Running" if is_running else "🔴 Stopped"
-        badge = _badge_for(*scan_map[file_name]) if file_name in scan_map else '⚪'
-        btn_text = f"{badge} {file_name} ({file_type}) - {status_icon}"
-        # Callback data includes user_id as script_owner_id
-        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f'file_{user_id}_{file_name}'))
-    bot.reply_to(message, "📂 Your files:\nClick to manage.", reply_markup=markup, parse_mode='Markdown')
+    text, menu = _files_view(user_id)
+    bot.reply_to(message, text, reply_markup=menu)
 
 def _logic_bot_speed(message):
     user_id = message.from_user.id
@@ -5214,8 +5965,8 @@ def _logic_bot_speed(message):
         bot.edit_message_text("❌ Error during speed test.", chat_id, wait_msg.message_id)
 
 def _logic_contact_owner(message):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton('📞 Contact Owner', url=f'https://t.me/{YOUR_USERNAME.replace("@", "")}'))
+    markup = NavMenu()
+    markup.add(NavButton('📞 Contact Owner', url=f'https://t.me/{YOUR_USERNAME.replace("@", "")}'))
     bot.reply_to(message, "Click to contact Owner:", reply_markup=markup)
 
 def _logic_manual_install(message):
@@ -5503,17 +6254,17 @@ def command_send_welcome(message):
 
 @bot.message_handler(commands=['account'])
 def command_account(message):
-    bot.send_message(message.chat.id, '<b>👤 Account Center</b>\nOpen your account overview from the button below.', parse_mode='HTML', reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('👤 My Account', callback_data='user_account')))
+    _nav_run(message, 'user_account')
 
 @bot.message_handler(commands=['mybots'])
 def command_mybots(message):
-    bot.send_message(message.chat.id, '<b>🤖 Your running scripts</b>', parse_mode='HTML', reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('Open Running Scripts', callback_data='my_running')))
+    _nav_run(message, 'my_running')
 
 @bot.message_handler(commands=['admindashboard'])
 def command_admindashboard(message):
     if message.from_user.id not in admin_ids:
         bot.reply_to(message, 'Admin permissions required.'); return
-    bot.send_message(message.chat.id, '<b>👑 Admin Control Center</b>', parse_mode='HTML', reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('Open Dashboard', callback_data='admin_dashboard')))
+    _nav_run(message, 'admin_dashboard')
 
 @bot.message_handler(commands=['status']) # Kept for direct command
 def command_show_status(message): _logic_statistics(message)
@@ -5531,18 +6282,8 @@ def command_retryfailed(message):
 
 BUTTON_TEXT_TO_LOGIC = {
     "🏠 Main Menu": _logic_send_welcome,
-    "👤 Account": lambda message: bot.send_message(
-        message.chat.id, '<b>👤 Account Center</b>', parse_mode='HTML',
-        reply_markup=types.InlineKeyboardMarkup().add(
-            types.InlineKeyboardButton('👤 My Account', callback_data='user_account')
-        )
-    ),
-    "🤖 My Bots": lambda message: bot.send_message(
-        message.chat.id, '<b>🤖 Your running scripts</b>', parse_mode='HTML',
-        reply_markup=types.InlineKeyboardMarkup().add(
-            types.InlineKeyboardButton('Open Running Scripts', callback_data='my_running')
-        )
-    ),
+    "👤 Account": lambda message: _nav_run(message, 'user_account'),
+    "🤖 My Bots": lambda message: _nav_run(message, 'my_running'),
     "📢 Updates Channel": _logic_updates_channel,
     "📤 Upload File": _logic_upload_file,
     "📂 Check Files": _logic_check_files,
@@ -5562,6 +6303,11 @@ BUTTON_TEXT_TO_LOGIC = {
     "📦 Manual Install": _logic_manual_install,
     "🆘 Help": _logic_help
 }
+
+@bot.message_handler(func=_nav_is_label, content_types=['text'])
+def handle_nav_key(message):
+    _nav_dispatch(message)
+
 
 @bot.message_handler(func=lambda message: message.text in BUTTON_TEXT_TO_LOGIC)
 def handle_button_text(message):
@@ -5647,37 +6393,36 @@ def _show_verdict(message, wait_msg, text):
 
 
 def _handle_scanned_upload(message, user_id, chat_id, file_name, file_ext, data, wait_msg):
-    """Scan an uploaded bot file and act on the threat level. Nothing is stored in the user's folder or started
-    before this decides: LOW -> start it, MEDIUM -> hold it and ask the admins, HIGH -> reject and drop it."""
+    """Static scan of an upload (the file is never run by the scan). Admin uploads run directly.
+    LOW -> start it, MEDIUM -> hold it for an admin, HIGH -> reject and drop it."""
+    file_type = file_ext[1:]
+    if user_id in admin_ids:
+        result = _build_result([], file_name, file_type, len(data))
+        result['sha256'] = hashlib.sha256(data).hexdigest()
+        ok, err = _deploy_upload(user_id, file_name, file_type, data, message, result, 'admin')
+        if not ok and err:
+            _safe_send(chat_id, f'⚠️ {html_escape(err)}')
+        return
     result = _scan_upload(data, file_ext, file_name)
     level = result['level']
-    file_type = file_ext[1:]
     uploader = message.from_user.first_name or message.from_user.username or str(user_id)
-    _note_scan_event(user_id, file_name, level, 'upload')
-    logger.info('Upload scan: user=%s file=%s level=%s score=%s', user_id, file_name, level, result.get('score'))
+    logger.info('Upload scan: user=%s file=%s level=%s', user_id, file_name, level)
     if level == THREAT_HIGH:
         _show_verdict(message, wait_msg, _user_verdict_text(result, file_name, 'rejected'))
-        notice = (f"🔴 <b>High-threat upload rejected</b>\n📄 <code>{html_escape(file_name)}</code> from "
-                  f"{html_escape(uploader)} (<code>{user_id}</code>)\n{_reason_lines_html(result, 4)}\n<i>Nothing was saved or run.</i>")
+        notice = (f"🔴 High-threat upload reject hua: <code>{html_escape(file_name)}</code> from "
+                  f"{html_escape(uploader)} (<code>{user_id}</code>)\n{_reason_lines_html(result, 2)}")
         for admin_id in sorted(admin_ids):
             _safe_send(admin_id, notice)
         return
-    if level == THREAT_MEDIUM and user_id not in admin_ids:
+    if level == THREAT_MEDIUM:
         token, err = _submit_for_review(user_id, uploader, chat_id, message.message_id, file_name, file_type, data, result)
         if token:
             _show_verdict(message, wait_msg, _user_verdict_text(result, file_name, 'review'))
         else:
-            head = f"{THREAT_BADGE[level]} <b>Threat level: {THREAT_NAME[level]}</b> (score {result.get('score', 0)})\n"
-            _show_verdict(message, wait_msg, head + _reason_lines_html(result, 5) + f"\n\n⛔ <b>Not started.</b> {html_escape(err)}")
+            _show_verdict(message, wait_msg, f"{THREAT_BADGE[level]} Start nahi hua. {html_escape(err)}")
         return
-    decision = 'auto'
-    if level == THREAT_MEDIUM:
-        decision = 'admin'   # an admin uploading their own file is the approver
-        _show_verdict(message, wait_msg, _user_verdict_text(result, file_name, 'review').split('\n\n⏳')[0] +
-                      '\n\n👑 You are an admin, so it is approved by you and starting now.')
-    else:
-        _show_verdict(message, wait_msg, _user_verdict_text(result, file_name, 'auto'))
-    ok, err = _deploy_upload(user_id, file_name, file_type, data, message, result, decision)
+    _show_verdict(message, wait_msg, _user_verdict_text(result, file_name, 'auto'))
+    ok, err = _deploy_upload(user_id, file_name, file_type, data, message, result, 'auto')
     if not ok and err:
         _safe_send(chat_id, f'⚠️ {html_escape(err)}')
 
@@ -5715,7 +6460,7 @@ def handle_file_upload_doc(message):
     current_files = get_user_file_count(user_id)
     if current_files >= file_limit:
         limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
-        bot.reply_to(message, f"⚠️ File limit ({current_files}/{limit_str}) reached. Delete files via /checkfiles.")
+        bot.reply_to(message, f"⚠️ File limit ({current_files}/{limit_str}) reached. Purani file delete karo, ya backup export/import karo.", reply_markup=_files_view(user_id)[1])
         return
 
     if not doc.file_name: bot.reply_to(message, "⚠️ No file name. Ensure file has a name."); return
@@ -5762,7 +6507,19 @@ def handle_file_upload_doc(message):
         bot.reply_to(message, f"❌ Unexpected error: {str(e)}")
 
 # --- Callback Query Handlers (for Inline Buttons) ---
-@bot.callback_query_handler(func=lambda call: True) 
+@bot.callback_query_handler(func=lambda call: True)
+def legacy_inline_callback(call):
+    """Inline buttons in messages sent before the keyboard upgrade: tell the person and show the menu."""
+    try:
+        bot.answer_callback_query(call.id, "Ye button purana hai, menu se dobara try karo.")
+    except Exception:
+        pass
+    try:
+        bot.send_message(call.message.chat.id, NAV_OLD_BUTTON_NOTE, reply_markup=create_main_menu_inline(call.from_user.id))
+    except Exception:
+        logger.exception("Could not answer an old inline button")
+
+
 def handle_callbacks(call):
     user_id = call.from_user.id
     data = call.data
@@ -5792,6 +6549,10 @@ def handle_callbacks(call):
         
     try:
         if data == 'upload': upload_callback(call)
+        elif data == 'gh_start': gh_start_callback(call)
+        elif data == 'gh_manual': gh_manual_callback(call)
+        elif data.startswith(('ghp_', 'ghx_')): gh_pick_callback(call)
+        elif data.startswith('ghu_'): gh_update_callback(call)
         elif data == 'check_files': check_files_callback(call)
         elif data.startswith('file_'): file_control_callback(call)
         elif data.startswith('start_'): start_bot_callback(call)
@@ -5852,11 +6613,9 @@ def handle_callbacks(call):
         elif data == 'list_mandatory_channels': admin_required_callback(call, list_mandatory_channels_callback)
         elif data.startswith('remove_channel_'): admin_required_callback(call, process_remove_channel)
         elif data == 'check_subscription_status': check_subscription_status_callback(call)
-        # --- Upload security review + Security Center (admins only) ---
+        # --- Upload approvals (admins only) ---
         elif data.startswith('rv_'): admin_required_callback(call, review_callback)
-        elif data == 'sec_center': admin_required_callback(call, security_center_callback)
-        elif data == 'sec_queue': admin_required_callback(call, security_queue_callback)
-        elif data == 'sec_rescan': admin_required_callback(call, security_rescan_callback)
+        elif data in ('adm_approvals', 'sec_center', 'sec_queue'): admin_required_callback(call, approvals_callback)
         # --- Security Approval Callbacks (older approval buttons that may still be in chats) ---
         elif data.startswith('approve_file_'): admin_required_callback(call, process_approve_file)
         elif data.startswith('reject_file_'): admin_required_callback(call, process_reject_file)
@@ -5912,10 +6671,10 @@ def user_account_callback(call):
         f"⭐ <b>Premium expiry:</b> {expiry_text}\n\n"
         "<i>Your account and hosting usage at a glance.</i>"
     )
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(types.InlineKeyboardButton('📂 Manage Files', callback_data='check_files'),
-           types.InlineKeyboardButton('🤖 Running Bots', callback_data='my_running'))
-    kb.add(types.InlineKeyboardButton('🏠 Main Menu', callback_data='back_to_main'))
+    kb = NavMenu(row_width=2)
+    kb.row(NavButton('📂 Manage Files', callback_data='check_files'),
+           NavButton('🤖 Running Bots', callback_data='my_running'))
+    kb.add(NavButton('🏠 Main Menu', callback_data='back_to_main'))
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
 
 
@@ -5932,16 +6691,16 @@ def my_running_callback(call):
                 rows.append((info.get('file_name', 'Unknown'), key))
         except Exception:
             continue
-    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb = NavMenu(row_width=1)
     if rows:
         for name, key in rows[:40]:
             owner_part, file_part = key.split('_', 1)
-            kb.add(types.InlineKeyboardButton(f'🟢 {name}', callback_data=f'file_{owner_part}_{file_part}'))
+            kb.add(NavButton(f'🟢 {name}', callback_data=f'file_{owner_part}_{file_part}'))
         body = f"<b>🤖 YOUR RUNNING SCRIPTS</b>\n━━━━━━━━━━━━━━━━━━\n🟢 Active processes: <b>{len(rows)}</b>\n\nSelect a script to open its controls."
     else:
         body = "<b>🤖 YOUR RUNNING SCRIPTS</b>\n━━━━━━━━━━━━━━━━━━\nNo scripts are running right now.\n\nUpload a script or start one from My Files."
-    kb.add(types.InlineKeyboardButton('📂 My Files', callback_data='check_files'))
-    kb.add(types.InlineKeyboardButton('🏠 Main Menu', callback_data='back_to_main'))
+    kb.add(NavButton('📂 My Files', callback_data='check_files'))
+    kb.add(NavButton('🏠 Main Menu', callback_data='back_to_main'))
     bot.edit_message_text(body, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
 
 
@@ -5956,10 +6715,10 @@ def user_help_callback(call):
         "<b>Useful commands</b>\n/start — Main menu\n/status — Statistics\n/ping — Response test\n/cancel — Cancel supported pending actions\n\n"
         "For account or hosting issues, contact the owner."
     )
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(types.InlineKeyboardButton('📂 My Files', callback_data='check_files'),
-           types.InlineKeyboardButton('📞 Contact Support', url='https://t.me/' + YOUR_USERNAME.replace('@', '')))
-    kb.add(types.InlineKeyboardButton('🏠 Main Menu', callback_data='back_to_main'))
+    kb = NavMenu(row_width=2)
+    kb.row(NavButton('📂 My Files', callback_data='check_files'),
+           NavButton('📞 Contact Support', url='https://t.me/' + YOUR_USERNAME.replace('@', '')))
+    kb.add(NavButton('🏠 Main Menu', callback_data='back_to_main'))
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
 
 
@@ -5987,18 +6746,18 @@ def admin_dashboard_callback(call):
         f"🔐 <b>Service mode:</b> {'Maintenance' if bot_locked else 'Online'}\n\n"
         "<i>Administrative tools and quick operations.</i>"
     )
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(types.InlineKeyboardButton('🩺 Hosting Health', callback_data='hosting_health'),
-           types.InlineKeyboardButton('👥 Users', callback_data='user_management'))
-    kb.row(types.InlineKeyboardButton('📢 Broadcast', callback_data='broadcast'),
-           types.InlineKeyboardButton('💳 Subscriptions', callback_data='subscription'))
-    kb.row(types.InlineKeyboardButton('🗄 Database Backup', callback_data='database_backup'),
-           types.InlineKeyboardButton('📤 Export Users', callback_data='export_users'))
-    kb.row(types.InlineKeyboardButton('📦 Export Full Backup', callback_data='export_database'),
-           types.InlineKeyboardButton('♻️ Import Full Backup', callback_data='import_database'))
-    kb.row(types.InlineKeyboardButton('⚙️ Settings', callback_data='admin_settings'),
-           types.InlineKeyboardButton('👑 Admins', callback_data='admin_panel'))
-    kb.add(types.InlineKeyboardButton('🏠 Main Menu', callback_data='back_to_main'))
+    kb = NavMenu(row_width=2)
+    kb.row(NavButton('🩺 Hosting Health', callback_data='hosting_health'),
+           NavButton('👥 Users', callback_data='user_management'))
+    kb.row(NavButton('📢 Broadcast', callback_data='broadcast'),
+           NavButton('💳 Subscriptions', callback_data='subscription'))
+    kb.row(NavButton('🗄 Database Backup', callback_data='database_backup'),
+           NavButton('📤 Export Users', callback_data='export_users'))
+    kb.row(NavButton('📦 Export Full Backup', callback_data='export_database'),
+           NavButton('♻️ Import Full Backup', callback_data='import_database'))
+    kb.row(NavButton('⚙️ Settings', callback_data='admin_settings'),
+           NavButton('👑 Admins', callback_data='admin_panel'))
+    kb.add(NavButton('🏠 Main Menu', callback_data='back_to_main'))
     bot.edit_message_text(body, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
 
 
@@ -6099,10 +6858,12 @@ def upload_callback(call):
     current_files = get_user_file_count(user_id)
     if current_files >= file_limit:
         limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
-        bot.answer_callback_query(call.id, f"⚠️ File limit ({current_files}/{limit_str}) reached.", show_alert=True)
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, f"⚠️ File limit ({current_files}/{limit_str}) reached. Purani file delete karo, ya backup export/import karo.",
+                         reply_markup=_files_view(user_id)[1])
         return
     bot.answer_callback_query(call.id) 
-    bot.send_message(call.message.chat.id, "📤 Send your Python (`.py`), JS (`.js`), or ZIP (`.zip`) file.")
+    _send_upload_choice(call.message.chat.id)
 
 def check_files_callback(call):
     user_id = call.from_user.id
@@ -6123,36 +6884,9 @@ def check_files_callback(call):
             bot.send_message(call.message.chat.id, subscription_message, reply_markup=markup, parse_mode='HTML')
         return
         
-    chat_id = call.message.chat.id 
-    user_files_list = user_files.get(user_id, [])
-    if not user_files_list:
-        bot.answer_callback_query(call.id, "⚠️ No files uploaded.", show_alert=True)
-        try:
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("♻️ Import My Bots (from backup)", callback_data=f'ubr_{user_id}'))
-            markup.add(types.InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main'))
-            bot.edit_message_text("📂 Your files:\n\n(No files uploaded)\nHave a backup? Tap Import My Bots.", chat_id, call.message.message_id, reply_markup=markup)
-        except Exception as e: logger.error(f"Error editing msg for empty file list: {e}")
-        return
-    bot.answer_callback_query(call.id) 
-    markup = types.InlineKeyboardMarkup(row_width=1) 
-    scan_map = get_scan_map(user_id)
-    for file_name, file_type in sorted(user_files_list): 
-        is_running = is_bot_running(user_id, file_name) # Use user_id for status check
-        status_icon = "🟢 Running" if is_running else "🔴 Stopped"
-        badge = _badge_for(*scan_map[file_name]) if file_name in scan_map else '⚪'
-        btn_text = f"{badge} {file_name} ({file_type}) - {status_icon}"
-        # Callback includes user_id as script_owner_id
-        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f'file_{user_id}_{file_name}'))
-    markup.row(types.InlineKeyboardButton("📦 Export My Bots", callback_data=f'ubk_{user_id}'),
-               types.InlineKeyboardButton("♻️ Import My Bots", callback_data=f'ubr_{user_id}'))
-    markup.add(types.InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main'))
-    try:
-        bot.edit_message_text("📂 Your files:\nClick to manage, or back up all your bots and their data.", chat_id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
-    except telebot.apihelper.ApiTelegramException as e:
-         if "message is not modified" in str(e): logger.warning("Msg not modified (files).")
-         else: logger.error(f"Error editing msg for file list: {e}")
-    except Exception as e: logger.error(f"Unexpected error editing msg for file list: {e}", exc_info=True)
+    bot.answer_callback_query(call.id)
+    text, menu = _files_view(user_id)
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=menu)
 
 def file_control_callback(call):
     try:
@@ -6180,8 +6914,10 @@ def file_control_callback(call):
         status_text = '🟢 Running' if is_running else '🔴 Stopped'
         file_type = next((f[1] for f in user_files_list if f[0] == file_name), '?') 
         try:
+            source_info = gh_read_sidecar(get_user_folder(script_owner_id), file_name)[0]
+            source_line = f"\n🐙 Source: `{source_info['url']}`" if source_info else ''
             bot.edit_message_text(
-                f"⚙️ Controls for: `{file_name}` ({file_type}) of User `{script_owner_id}`\nStatus: {status_text}",
+                f"⚙️ Controls for: `{file_name}` ({file_type}) of User `{script_owner_id}`\nStatus: {status_text}{source_line}",
                 call.message.chat.id, call.message.message_id,
                 reply_markup=create_control_buttons(script_owner_id, file_name, is_running),
                 parse_mode='Markdown'
@@ -6467,6 +7203,9 @@ def delete_bot_callback(call):
             try: os.remove(env_path); deleted_disk.append(os.path.basename(env_path)); logger.info(f"Deleted environment file: {env_path}")
             except OSError as e: logger.error(f"Error deleting {env_path}: {e}")
 
+        side_path = gh_sidecar_path(user_folder, file_name)
+        if side_path and os.path.isfile(side_path):
+            _remove_quietly(side_path)
         remove_user_file_db(script_owner_id, file_name)
         deleted_str = ", ".join(f"`{f}`" for f in deleted_disk) if deleted_disk else "associated files"
         try:
@@ -6558,17 +7297,17 @@ def _env_panel(owner_id, file_name, reveal=False):
         lines.append(footer)
     else:
         lines.append("No variables yet. Tap <b>Add / Update</b> and send them like a .env file, for example <code>BOT_TOKEN=123:abc</code>.")
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(types.InlineKeyboardButton("➕ Add / Update", callback_data=f'enva_{owner_id}_{file_name}'),
-               types.InlineKeyboardButton("🗑 Delete One", callback_data=f'envd_{owner_id}_{file_name}') if env else
-               types.InlineKeyboardButton("🔄 Refresh", callback_data=f'envm_{owner_id}_{file_name}'))
+    markup = NavMenu(row_width=2)
+    markup.row(NavButton("➕ Add / Update", callback_data=f'enva_{owner_id}_{file_name}'),
+               NavButton("🗑 Delete One", callback_data=f'envd_{owner_id}_{file_name}') if env else
+               NavButton("🔄 Refresh", callback_data=f'envm_{owner_id}_{file_name}'))
     if env:
-        view_btn = (types.InlineKeyboardButton("🙈 Hide Values", callback_data=f'envm_{owner_id}_{file_name}') if reveal
-                    else types.InlineKeyboardButton("👁 Show Values", callback_data=f'envv_{owner_id}_{file_name}'))
-        markup.row(view_btn, types.InlineKeyboardButton("🧹 Clear All", callback_data=f'envc_{owner_id}_{file_name}'))
+        view_btn = (NavButton("🙈 Hide Values", callback_data=f'envm_{owner_id}_{file_name}') if reveal
+                    else NavButton("👁 Show Values", callback_data=f'envv_{owner_id}_{file_name}'))
+        markup.row(view_btn, NavButton("🧹 Clear All", callback_data=f'envc_{owner_id}_{file_name}'))
     if is_bot_running(owner_id, file_name):
-        markup.row(types.InlineKeyboardButton("🔄 Restart Now (apply changes)", callback_data=f'restart_{owner_id}_{file_name}'))
-    markup.row(types.InlineKeyboardButton("🔙 Back to Controls", callback_data=f'file_{owner_id}_{file_name}'))
+        markup.row(NavButton("🔄 Restart Now (apply changes)", callback_data=f'restart_{owner_id}_{file_name}'))
+    markup.row(NavButton("🔙 Back to Controls", callback_data=f'file_{owner_id}_{file_name}'))
     return "\n".join(lines), markup
 
 
@@ -6623,8 +7362,8 @@ def env_callback(call):
                       "A name that already exists is updated, new names are added. Lines starting with # are ignored. "
                       "If a value has spaces, put it in quotes.\n"
                       "I delete your message after saving so the secrets do not stay in the chat.")
-            markup = types.InlineKeyboardMarkup().add(
-                types.InlineKeyboardButton("❌ Cancel", callback_data=f'envm_{owner_id}_{file_name}'))
+            markup = NavMenu().add(
+                NavButton("❌ Cancel", callback_data=f'envm_{owner_id}_{file_name}'))
             _edit_or_send(call, prompt, markup)
             bot.register_next_step_handler(call.message, _env_receive_input, owner_id, file_name, call.from_user.id)
         elif action == 'envd':
@@ -6633,10 +7372,10 @@ def env_callback(call):
             if not env:
                 _env_show_panel(call, owner_id, file_name)
                 return
-            markup = types.InlineKeyboardMarkup(row_width=2)
-            markup.add(*[types.InlineKeyboardButton(f"🗑 {key}", callback_data=f'envk_{owner_id}_{_env_key_tag(key)}_{file_name}')
+            markup = NavMenu(row_width=2)
+            markup.add(*[NavButton(f"🗑 {key}", callback_data=f'envk_{owner_id}_{_env_key_tag(key)}_{file_name}')
                          for key in sorted(env)])
-            markup.row(types.InlineKeyboardButton("🔙 Back", callback_data=f'envm_{owner_id}_{file_name}'))
+            markup.row(NavButton("🔙 Back", callback_data=f'envm_{owner_id}_{file_name}'))
             _edit_or_send(call, f"🗑 Which variable of <code>{html_escape(file_name)}</code> should be deleted?", markup)
         elif action == 'envk':
             env = load_bot_env(user_folder, file_name)
@@ -6648,9 +7387,9 @@ def env_callback(call):
             _env_show_panel(call, owner_id, file_name)
         elif action == 'envc':
             bot.answer_callback_query(call.id)
-            markup = types.InlineKeyboardMarkup()
-            markup.row(types.InlineKeyboardButton("✅ Yes, delete all", callback_data=f'envy_{owner_id}_{file_name}'),
-                       types.InlineKeyboardButton("❌ No", callback_data=f'envm_{owner_id}_{file_name}'))
+            markup = NavMenu()
+            markup.row(NavButton("✅ Yes, delete all", callback_data=f'envy_{owner_id}_{file_name}'),
+                       NavButton("❌ No", callback_data=f'envm_{owner_id}_{file_name}'))
             _edit_or_send(call, f"🧹 Delete <b>all</b> variables of <code>{html_escape(file_name)}</code>?", markup)
         elif action == 'envy':
             count = clear_bot_env(user_folder, file_name)
@@ -6754,8 +7493,8 @@ def _env_receive_input(message, owner_id, file_name, expected_uid):
 
 
 def _env_back_markup(owner_id, file_name):
-    return types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("🔑 Open Environment", callback_data=f'envm_{owner_id}_{file_name}'))
+    return NavMenu().add(
+        NavButton("🔑 Open Environment", callback_data=f'envm_{owner_id}_{file_name}'))
 
 
 def speed_callback(call):
@@ -6837,11 +7576,6 @@ def back_to_main_callback(call):
                       f"👇 Use buttons or type commands.")
     try:
         bot.answer_callback_query(call.id)
-        # Restore the persistent reply keyboard when returning from inline panels.
-        bot.send_message(
-            chat_id, "⌨️ Reply keyboard is ready below.",
-            reply_markup=create_reply_main_menu(user_id)
-        )
         bot.edit_message_text(main_menu_text, chat_id, call.message.message_id,
                               reply_markup=create_main_menu_inline(user_id), parse_mode='Markdown')
     except telebot.apihelper.ApiTelegramException as e:
@@ -6901,9 +7635,9 @@ def process_broadcast_message(message):
          return
 
     target_count = len(active_users)
-    markup = types.InlineKeyboardMarkup()
-    markup.row(types.InlineKeyboardButton("✅ Confirm & Send", callback_data=f"confirm_broadcast_{message.message_id}"),
-               types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast"))
+    markup = NavMenu()
+    markup.row(NavButton("✅ Confirm & Send", callback_data=f"confirm_broadcast_{message.message_id}"),
+               NavButton("❌ Cancel", callback_data="cancel_broadcast"))
 
     preview_text = broadcast_content[:1000].strip().replace('`' * 3, "'" * 3) if broadcast_content else "(Media message)"
     bot.reply_to(message, f"⚠️ Confirm Broadcast:\n\n```\n{preview_text}\n```\n" 
@@ -7385,21 +8119,21 @@ def display_users_list(chat_id, message_id, users_list, page, total_pages, chunk
         
         message_text += f"{i}. `{user_id}` {status}\n"
     
-    markup = types.InlineKeyboardMarkup(row_width=3)
+    markup = NavMenu(row_width=3)
     
     if total_pages > 1:
         page_buttons = []
         if page > 0:
-            page_buttons.append(types.InlineKeyboardButton("⬅️ Previous", callback_data=f"users_page_{page-1}"))
+            page_buttons.append(NavButton("⬅️ Previous", callback_data=f"users_page_{page-1}"))
         
-        page_buttons.append(types.InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+        page_buttons.append(NavButton(f"{page+1}/{total_pages}", callback_data="noop"))
         
         if page < total_pages - 1:
-            page_buttons.append(types.InlineKeyboardButton("Next ➡️", callback_data=f"users_page_{page+1}"))
+            page_buttons.append(NavButton("Next ➡️", callback_data=f"users_page_{page+1}"))
         
         markup.row(*page_buttons)
     
-    markup.row(types.InlineKeyboardButton("🔙 Back to User Management", callback_data='user_management'))
+    markup.row(NavButton("🔙 Back to User Management", callback_data='user_management'))
     
     try:
         bot.edit_message_text(message_text, chat_id, message_id, reply_markup=markup, parse_mode='Markdown')
@@ -8083,13 +8817,13 @@ def remove_mandatory_channel_callback(call):
         
     bot.answer_callback_query(call.id)
     
-    markup = types.InlineKeyboardMarkup()
+    markup = NavMenu()
     for channel_id, channel_info in list(mandatory_channels.items()):
         channel_name = channel_info.get('name', 'Unknown')
         button_text = f"🗑️ {channel_name}"
-        markup.add(types.InlineKeyboardButton(button_text, callback_data=f'remove_channel_{channel_id}'))
+        markup.add(NavButton(button_text, callback_data=f'remove_channel_{channel_id}'))
     
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data='manage_mandatory_channels'))
+    markup.add(NavButton("🔙 Back", callback_data='manage_mandatory_channels'))
     
     try:
         bot.edit_message_text("📢 Choose channel to delete:",
@@ -8370,6 +9104,13 @@ def run_polling_forever():
 
 
 # --- Main Execution ---
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and bool(m.text) and not m.text.startswith('/'),
+                     content_types=['text'])
+def handle_stale_text(message):
+    """Registered last: any other text brings the current keyboard back."""
+    _nav_stale(message)
+
+
 if __name__ == '__main__':
     logger.info("Starting up. Python %s | data dir: %s | owner: %s | admins: %s | banned: %s | channels: %s",
                 sys.version.split()[0], IROTECH_DIR, OWNER_ID, len(admin_ids), len(banned_users),
