@@ -248,12 +248,18 @@ NAV_BACK = '⬅️ Back'
 NAV_RESERVED = (NAV_CANCEL, NAV_HOME, NAV_BACK)
 NAV_OLD_BUTTON_NOTE = "Ye button purana hai, menu se dobara try karo 👇"
 
-# category -> Bot API button style (None = default look), tried in this order against the label text
-# (first match wins). red = danger, green = success, blue = primary; orange (warn) keeps the default look.
+# category -> Bot API button style, tried in this order against the label text (first match wins).
+# red = danger (stop/delete/reject/cancel/clear/remove/ban/no), green = success (start/run/approve/confirm/yes/
+# save/deploy/done/add/join), blue = primary (everything else: Back, Home, Import, Restart, Refresh, lists, admin).
+# EVERY button gets one of the three: NAV_FALLBACK_STYLE (blue) is used whenever nothing else applies, so no
+# button is ever left plain. (restart/refresh/retry/lock/import/restore sit before 'success' so that "Restart"
+# does not turn green because of "start"; they are blue.)
+NAV_FALLBACK_STYLE = 'primary'
 NAV_THEME = [
-    ('danger',  'danger',  r'delete|remove|reject|\bban\b|\bstop|kill|wipe|clear'),
-    ('warn',    None,      r'restart|refresh|retry|(?<!un)lock|import|restore|expire'),
-    ('success', 'success', r'start|\brun|approve|confirm|\byes\b|unban|unlock|\bdone|accept|\badd\b|join'),
+    ('danger',  'danger',  r'delete|remove|reject|\bban\b|\bstop|kill|wipe|clear|cancel|\bno\b'),
+    ('confirm', 'success', r'\byes\b|confirm|approve|accept|\bdone'),
+    ('warn',    'primary', r'restart|refresh|retry|(?<!un)lock|import|restore|expire'),
+    ('success', 'success', r'start|\brun|approve|confirm|\byes\b|unban|unlock|\bdone|accept|\badd\b|join|\bsave|deploy|verify'),
     ('admin',   'primary', r'admin|user management|broadcast|subscription|approval|channel|setting|health|manage'),
     ('info',    'primary', r'.'),
 ]
@@ -310,8 +316,28 @@ def _nav_category(text):
     low = text.lower()
     for name, style, rx in NAV_THEME:
         if re.search(rx, low):
-            return style
-    return NAV_THEME[-1][1]
+            return style if style in NAV_STYLES else NAV_FALLBACK_STYLE
+    return NAV_FALLBACK_STYLE
+
+
+def _nav_style_of(text, action, number=None):
+    """The colour of one key. Numbered file keys show the state of the bot (green running, red stopped);
+    removal keys are red; every other numbered / list key is blue; the rest follows NAV_THEME."""
+    emoji, rest = _nav_split_label(_nav_strip_squares(text))
+    if isinstance(action, str):
+        if action.startswith(('envk_', 'remove_channel_')):
+            return 'danger'
+        if action.startswith('file_'):
+            if '▶️' in text:
+                return 'success'
+            if '⏹️' in text or '⏹' in text:
+                return 'danger'
+            if emoji == '🟢':                 # list of running bots
+                return 'success'
+            return NAV_FALLBACK_STYLE
+    if number is not None:
+        return NAV_FALLBACK_STYLE
+    return _nav_category(rest)
 
 
 def _nav_strip_squares(text):
@@ -322,8 +348,13 @@ def _nav_strip_squares(text):
     return t
 
 
+NAV_FALLBACK_EMOJI = '🔹'
+
+
 def _nav_label(text, action, number=None):
     emoji, rest = _nav_split_label(_nav_strip_squares(text))
+    if not emoji and not re.match(r'^\s*\d+\.\s', rest):
+        emoji = NAV_FALLBACK_EMOJI                       # every key starts with an emoji (a "1." list number counts as its lead)
     if number is not None:
         label = f"{number}. {rest if not emoji else emoji + ' ' + rest}"
     else:
@@ -364,13 +395,15 @@ def _nav_style_for(label, styles):
     if not NAV_STYLE_ENABLED:
         return None
     st = (styles or {}).get(label)
-    return st if st in NAV_STYLES else None
+    return st if st in NAV_STYLES else NAV_FALLBACK_STYLE      # the single fallback: no plain buttons
 
 
 def _nav_make_button(label, style=None):
     """A KeyboardButton that sends "style" to Telegram, whatever pyTelegramBotAPI version is installed."""
-    if style not in NAV_STYLES or not NAV_STYLE_ENABLED:
+    if not NAV_STYLE_ENABLED:
         return types.KeyboardButton(label)
+    if style not in NAV_STYLES:
+        style = NAV_FALLBACK_STYLE
     btn = None
     try:
         btn = types.KeyboardButton(label, style=style)       # newer library versions know the field
@@ -434,7 +467,7 @@ def _nav_build(chat_id, menu, cancel_only=False):
                 counter += 1
                 number = counter
             label = _nav_label(b.text, action, number)
-            style = NAV_THEME[-1][1] if number is not None else _nav_category(_nav_split_label(_nav_strip_squares(b.text))[1])
+            style = _nav_style_of(b.text, action, number)
             if _NAV_BACK_RX.match(b.text):
                 has_custom_back = True
             base, n = label, 2
@@ -455,6 +488,8 @@ def _nav_build(chat_id, menu, cancel_only=False):
         tail.append(NAV_HOME)
         amap[NAV_HOME] = 'back_to_main'
         rows.append(tail)
+        for lab in tail:
+            styles[lab] = NAV_FALLBACK_STYLE                  # Back and Home are blue
     with NAV_LOCK:
         _nav_forget_old()
         st = NAV_STATE.get(chat_id) or _nav_blank()
@@ -469,7 +504,7 @@ def _nav_cancel_menu(chat_id):
     rows = [[NAV_CANCEL, NAV_HOME]]
     with NAV_LOCK:
         st = NAV_STATE.get(chat_id) or _nav_blank()
-        styles = {NAV_CANCEL: 'danger'}
+        styles = {NAV_CANCEL: 'danger', NAV_HOME: NAV_FALLBACK_STYLE}
         st.update({'map': {NAV_CANCEL: 'nav_cancel', NAV_HOME: 'back_to_main'}, 'rows': rows, 'styles': styles,
                    'time': time.time(), 'await': True})
         st['seq'] += 1
@@ -2057,7 +2092,7 @@ def create_subscription_check_message(not_joined_channels):
 
         message += f"• {html_escape(str(channel_name))}\n"
         if channel_link:
-            markup.add(NavButton(f"Join {channel_name}"[:64], url=channel_link))
+            markup.add(NavButton(f"📢 Join {channel_name}"[:64], url=channel_link))
         else:
             message += "  Private invite link unavailable; contact the bot owner.\n"
     
@@ -4791,12 +4826,21 @@ def _gh_offer_pick(ctx, candidates, fallback):
     return True
 
 
+def _gh_menu_back(ctx):
+    """After a cancelled / expired deploy: put the main menu keyboard back (never raises)."""
+    try:
+        bot.send_message(ctx['chat_id'], "🏠 Menu", reply_markup=create_main_menu_inline(ctx['actor_id']))
+    except Exception:
+        logger.debug('Could not restore the menu after a GitHub cancel')
+
+
 def _gh_expire_token(token):
     with GH_LOCK:
         ctx = GH_PENDING.pop(token, None)
     if ctx is not None:
         _gh_say(ctx, f"{_gh_head(ctx)}\n⌛ Main file chuni nahi gayi, isliye deploy cancel ho gaya. Dobara Upload se shuru karo.")
         _gh_cleanup(ctx)
+        _gh_menu_back(ctx)
 
 
 def _gh_cancel_user(user_id):
@@ -4932,7 +4976,8 @@ def _upload_limit_ok(user_id, chat_id):
 def gh_manual_callback(call):
     bot.answer_callback_query(call.id)
     if _upload_limit_ok(call.from_user.id, call.message.chat.id):
-        bot.send_message(call.message.chat.id, "📤 Send your Python (`.py`), JS (`.js`), or ZIP (`.zip`) file.")
+        bot.send_message(call.message.chat.id, "📤 Send your Python (`.py`), JS (`.js`), or ZIP (`.zip`) file.",
+                         reply_markup=NavMenu().add(NavButton('❌ Cancel', callback_data='nav_cancel')))
 
 
 def gh_start_callback(call):
@@ -5003,6 +5048,7 @@ def gh_pick_callback(call):
         bot.answer_callback_query(call.id, 'Cancel ho gaya.')
         _gh_say(ctx, f"{_gh_head(ctx)}\n❎ Cancel ho gaya, kuch save nahi hua.")
         _gh_cleanup(ctx)
+        _gh_menu_back(ctx)
         return
     try:
         main = ctx['candidates'][int(parts[2])]
@@ -6502,6 +6548,22 @@ def _handle_scanned_upload(message, user_id, chat_id, file_name, file_ext, data,
 
 @bot.message_handler(content_types=['document'])
 def handle_file_upload_doc(message):
+    """Run the upload; when it ends without showing a new keyboard (rejected, held for review, error),
+    put the main menu back so no stale Cancel/upload keys are left on screen."""
+    chat_id = message.chat.id
+    before = (_nav_get(chat_id) or {}).get('seq', 0)
+    try:
+        _handle_file_upload_doc_body(message)
+    finally:
+        try:
+            st = _nav_get(chat_id)
+            if st is None or st.get('seq', 0) == before or st.get('await'):
+                bot.send_message(chat_id, "🏠 Menu", reply_markup=create_main_menu_inline(message.from_user.id))
+        except Exception:
+            logger.exception("Could not restore the menu after an upload")
+
+
+def _handle_file_upload_doc_body(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     
@@ -7284,11 +7346,12 @@ def delete_bot_callback(call):
         try:
             bot.edit_message_text(
                 f"🗑️ Record `{file_name}` (User `{script_owner_id}`) and {deleted_str} deleted!",
-                chat_id_for_reply, call.message.message_id, reply_markup=None, parse_mode='Markdown'
+                chat_id_for_reply, call.message.message_id, reply_markup=create_main_menu_inline(call.from_user.id), parse_mode='Markdown'
             )
         except Exception as e:
             logger.error(f"Error editing msg after delete: {e}")
-            bot.send_message(chat_id_for_reply, f"🗑️ Record `{file_name}` deleted.", parse_mode='Markdown')
+            bot.send_message(chat_id_for_reply, f"🗑️ Record `{file_name}` deleted.", parse_mode='Markdown',
+                             reply_markup=create_main_menu_inline(call.from_user.id))
     except (ValueError, IndexError) as e:
         logger.error(f"Error parsing delete callback '{call.data}': {e}")
         bot.answer_callback_query(call.id, "Error: Invalid delete command.", show_alert=True)
@@ -7695,6 +7758,10 @@ def broadcast_init_callback(call):
     msg = bot.send_message(call.message.chat.id, "📢 Send message to broadcast.\n/cancel to abort.")
     bot.register_next_step_handler(msg, process_broadcast_message)
 
+BROADCAST_PENDING = {}          # (chat_id, original message id) -> the admin's message to send; a key press has no reply_to_message
+BROADCAST_PENDING_MAX = 20
+
+
 def process_broadcast_message(message):
     user_id = message.from_user.id
     if user_id not in admin_ids: bot.reply_to(message, "⚠️ Not authorized."); return
@@ -7708,6 +7775,9 @@ def process_broadcast_message(message):
          return
 
     target_count = len(active_users)
+    BROADCAST_PENDING[(message.chat.id, message.message_id)] = message
+    while len(BROADCAST_PENDING) > BROADCAST_PENDING_MAX:
+        BROADCAST_PENDING.pop(next(iter(BROADCAST_PENDING)), None)
     markup = NavMenu()
     markup.row(NavButton("✅ Confirm & Send", callback_data=f"confirm_broadcast_{message.message_id}"),
                NavButton("❌ Cancel", callback_data="cancel_broadcast"))
@@ -7722,6 +7792,12 @@ def handle_confirm_broadcast(call):
     if user_id not in admin_ids: bot.answer_callback_query(call.id, "⚠️ Admin only.", show_alert=True); return
     try:
         original_message = call.message.reply_to_message
+        if not original_message:
+            try:
+                key = (chat_id, int(call.data.rsplit('_', 1)[1]))
+            except (ValueError, IndexError, AttributeError):
+                key = None
+            original_message = BROADCAST_PENDING.pop(key, None) if key else None
         if not original_message: raise ValueError("Could not retrieve original message.")
 
         # Check content type and get content
@@ -7752,7 +7828,7 @@ def handle_confirm_broadcast(call):
 
         bot.answer_callback_query(call.id, "🚀 Starting broadcast...")
         bot.edit_message_text(f"📢 Broadcasting to {len(active_users)} users...",
-                              chat_id, call.message.message_id, reply_markup=None)
+                              chat_id, call.message.message_id, reply_markup=create_main_menu_inline(user_id))
         # Pass all potential content types to execute_broadcast
         thread = threading.Thread(name='broadcast', daemon=True, target=execute_broadcast, args=(
             broadcast_text, broadcast_photo_id, broadcast_video_id,
@@ -7761,14 +7837,22 @@ def handle_confirm_broadcast(call):
         thread.start()
     except ValueError as ve: 
         logger.error(f"Error retrieving msg for broadcast confirm: {ve}")
-        bot.edit_message_text(f"❌ Error starting broadcast: {ve}", chat_id, call.message.message_id, reply_markup=None)
+        bot.edit_message_text(f"❌ Error starting broadcast: {ve}", chat_id, call.message.message_id, reply_markup=create_main_menu_inline(user_id))
     except Exception as e:
         logger.error(f"Error in handle_confirm_broadcast: {e}", exc_info=True)
-        bot.edit_message_text("❌ Unexpected error during broadcast confirm.", chat_id, call.message.message_id, reply_markup=None)
+        bot.edit_message_text("❌ Unexpected error during broadcast confirm.", chat_id, call.message.message_id, reply_markup=create_main_menu_inline(user_id))
 
 def handle_cancel_broadcast(call):
     bot.answer_callback_query(call.id, "Broadcast cancelled.")
+    try:
+        BROADCAST_PENDING.pop((call.message.chat.id, int(getattr(call, 'data', '').rsplit('_', 1)[1])), None)
+    except Exception:
+        pass
     bot.delete_message(call.message.chat.id, call.message.message_id)
+    try:
+        bot.send_message(call.message.chat.id, "❎ Broadcast cancelled.", reply_markup=create_main_menu_inline(call.from_user.id))
+    except Exception:
+        logger.exception("Could not restore the menu after cancelling a broadcast")
     # Optionally delete the original message too if call.message.reply_to_message exists
     if call.message.reply_to_message:
         try: bot.delete_message(call.message.chat.id, call.message.reply_to_message.message_id)
@@ -8199,10 +8283,10 @@ def display_users_list(chat_id, message_id, users_list, page, total_pages, chunk
         if page > 0:
             page_buttons.append(NavButton("⬅️ Previous", callback_data=f"users_page_{page-1}"))
         
-        page_buttons.append(NavButton(f"{page+1}/{total_pages}", callback_data="noop"))
+        page_buttons.append(NavButton(f"📄 {page+1}/{total_pages}", callback_data="noop"))
         
         if page < total_pages - 1:
-            page_buttons.append(NavButton("Next ➡️", callback_data=f"users_page_{page+1}"))
+            page_buttons.append(NavButton("➡️ Next", callback_data=f"users_page_{page+1}"))
         
         markup.row(*page_buttons)
     
