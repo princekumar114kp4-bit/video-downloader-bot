@@ -232,8 +232,11 @@ def _retry_after_seconds(exc, default=5):
 # described with NavMenu/NavButton (same add/row calls the old inline buttons used); SafeTeleBot turns a
 # NavMenu into a ReplyKeyboardMarkup when it sends it. Pressing a key sends its label as normal text; the
 # text handler below finds the action behind that label for this chat and runs the existing screen code.
-# Note: Telegram does not allow custom (premium) emoji inside reply-keyboard button text, so the colours
-# come from standard coloured emoji. All of the look is in NAV_THEME below.
+# Colour: labels carry NO coloured-square prefix any more. The colour is the real button "style" field of
+# Telegram Bot API 9.4 ("primary" blue, "success" green, "danger" red; no style = default grey). It is added
+# to the keyboard JSON by _nav_make_button even if the installed pyTelegramBotAPI does not know the field.
+# Clients or servers that ignore the field simply show normal buttons. BUTTON_STYLE=0/off turns it off.
+# No custom (premium) emoji ids are used. All of the look is in NAV_THEME below.
 NAV_TTL = 6 * 3600           # a keyboard state is forgotten after this many seconds
 NAV_MAX_STATES = 5000        # most chats kept in memory
 NAV_MAX_BUTTONS = 60         # Telegram allows about 100; keep the keyboard readable
@@ -245,14 +248,19 @@ NAV_BACK = '⬅️ Back'
 NAV_RESERVED = (NAV_CANCEL, NAV_HOME, NAV_BACK)
 NAV_OLD_BUTTON_NOTE = "Ye button purana hai, menu se dobara try karo 👇"
 
-# category -> coloured square, tried in this order against the label text (first match wins)
+# category -> Bot API button style (None = default look), tried in this order against the label text
+# (first match wins). red = danger, green = success, blue = primary; orange (warn) keeps the default look.
 NAV_THEME = [
-    ('danger',  '🟥', r'delete|remove|reject|\bban\b|\bstop|kill|wipe|clear'),
-    ('warn',    '🟧', r'restart|refresh|retry|(?<!un)lock|import|restore|expire'),
-    ('success', '🟩', r'start|\brun|approve|confirm|\byes\b|unban|unlock|\bdone|accept|\badd\b|join'),
-    ('admin',   '🟪', r'admin|user management|broadcast|subscription|approval|channel|setting|health|manage'),
-    ('info',    '🟦', r'.'),
+    ('danger',  'danger',  r'delete|remove|reject|\bban\b|\bstop|kill|wipe|clear'),
+    ('warn',    None,      r'restart|refresh|retry|(?<!un)lock|import|restore|expire'),
+    ('success', 'success', r'start|\brun|approve|confirm|\byes\b|unban|unlock|\bdone|accept|\badd\b|join'),
+    ('admin',   'primary', r'admin|user management|broadcast|subscription|approval|channel|setting|health|manage'),
+    ('info',    'primary', r'.'),
 ]
+NAV_STYLE_ENABLED = os.environ.get('BUTTON_STYLE', '1').strip().lower() not in ('0', 'off', 'false', 'no', 'disable', 'disabled')
+NAV_STYLES = ('primary', 'success', 'danger')
+# squares an older version put in front of labels; keyboards already on phones may still send them
+NAV_OLD_SQUARES = '🟦🟩🟧🟥🟪🟨⬛⬜🟫'
 NAV_NUMBERED_PREFIXES = ('file_', 'rv_', 'remove_channel_')
 
 NAV_STATE = {}
@@ -300,20 +308,26 @@ def _nav_split_label(text):
 
 def _nav_category(text):
     low = text.lower()
-    for name, square, rx in NAV_THEME:
+    for name, style, rx in NAV_THEME:
         if re.search(rx, low):
-            return square
+            return style
     return NAV_THEME[-1][1]
 
 
+def _nav_strip_squares(text):
+    """Remove leading coloured squares (old labels) and the space after them."""
+    t = text.lstrip()
+    while t and t[0] in NAV_OLD_SQUARES:
+        t = t[1:].lstrip()
+    return t
+
+
 def _nav_label(text, action, number=None):
-    emoji, rest = _nav_split_label(text)
+    emoji, rest = _nav_split_label(_nav_strip_squares(text))
     if number is not None:
-        square = NAV_THEME[-1][1]
-        label = f"{square} {number}. {rest if not emoji else emoji + ' ' + rest}"
+        label = f"{number}. {rest if not emoji else emoji + ' ' + rest}"
     else:
-        square = _nav_category(rest)
-        label = f"{square} {emoji + ' ' if emoji else ''}{rest}"
+        label = f"{emoji + ' ' if emoji else ''}{rest}"
     if len(label) > NAV_LABEL_MAX:
         label = label[:NAV_LABEL_MAX - 1].rstrip() + '…'
     return label
@@ -346,11 +360,56 @@ def _nav_blank():
     return {'map': {}, 'rows': [], 'time': time.time(), 'cur': None, 'stack': [], 'seq': 0, 'await': False}
 
 
-def _nav_rows_to_markup(rows):
+def _nav_style_for(label, styles):
+    if not NAV_STYLE_ENABLED:
+        return None
+    st = (styles or {}).get(label)
+    return st if st in NAV_STYLES else None
+
+
+def _nav_make_button(label, style=None):
+    """A KeyboardButton that sends "style" to Telegram, whatever pyTelegramBotAPI version is installed."""
+    if style not in NAV_STYLES or not NAV_STYLE_ENABLED:
+        return types.KeyboardButton(label)
+    btn = None
+    try:
+        btn = types.KeyboardButton(label, style=style)       # newer library versions know the field
+    except Exception:
+        btn = None
+    if btn is None:
+        btn = types.KeyboardButton(label)
+    try:
+        has = callable(getattr(btn, 'to_dict', None))
+        if has and btn.to_dict().get('style') == style:
+            return btn
+        btn.style = style
+        if has:
+            orig = btn.to_dict
+
+            def _to_dict(_orig=orig, _style=style):
+                d = _orig()
+                if isinstance(d, dict):
+                    d['style'] = _style
+                return d
+            btn.to_dict = _to_dict
+    except Exception:
+        pass                                                  # worst case: a normal, uncoloured button
+    return btn
+
+
+def _nav_rows_to_markup(rows, styles=None):
     kb = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True, one_time_keyboard=False,
                                    input_field_placeholder="Button dabao...")
     for row in rows:
-        kb.row(*[types.KeyboardButton(label) for label in row])
+        kb.row(*[_nav_make_button(label, _nav_style_for(label, styles)) for label in row])
+    try:                                                      # last safety: styled buttons already turned into dicts
+        for row, labels in zip(kb.keyboard, rows):
+            for item, label in zip(row, labels):
+                sty = _nav_style_for(label, styles)
+                if sty and isinstance(item, dict) and 'style' not in item:
+                    item['style'] = sty
+    except Exception:
+        pass
     return kb
 
 
@@ -359,7 +418,7 @@ def _nav_build(chat_id, menu, cancel_only=False):
     buttons = [b for row in menu.rows for b in row][:NAV_MAX_BUTTONS]
     main = _nav_is_main_menu(buttons)
     used = set(NAV_RESERVED)
-    amap, rows = {}, []
+    amap, rows, styles = {}, [], {}
     has_custom_back = False
     counter = 0
     for row in menu.rows:
@@ -375,6 +434,7 @@ def _nav_build(chat_id, menu, cancel_only=False):
                 counter += 1
                 number = counter
             label = _nav_label(b.text, action, number)
+            style = NAV_THEME[-1][1] if number is not None else _nav_category(_nav_split_label(_nav_strip_squares(b.text))[1])
             if _NAV_BACK_RX.match(b.text):
                 has_custom_back = True
             base, n = label, 2
@@ -383,6 +443,7 @@ def _nav_build(chat_id, menu, cancel_only=False):
                 n += 1
             used.add(label)
             amap[label] = action
+            styles[label] = style
             out.append(label)
         if out:
             rows.append(out)
@@ -397,10 +458,10 @@ def _nav_build(chat_id, menu, cancel_only=False):
     with NAV_LOCK:
         _nav_forget_old()
         st = NAV_STATE.get(chat_id) or _nav_blank()
-        st.update({'map': amap, 'rows': rows, 'time': time.time(), 'await': False})
+        st.update({'map': amap, 'rows': rows, 'styles': styles, 'time': time.time(), 'await': False})
         st['seq'] += 1
         NAV_STATE[chat_id] = st
-    return _nav_rows_to_markup(rows)
+    return _nav_rows_to_markup(rows, styles)
 
 
 def _nav_cancel_menu(chat_id):
@@ -408,11 +469,12 @@ def _nav_cancel_menu(chat_id):
     rows = [[NAV_CANCEL, NAV_HOME]]
     with NAV_LOCK:
         st = NAV_STATE.get(chat_id) or _nav_blank()
-        st.update({'map': {NAV_CANCEL: 'nav_cancel', NAV_HOME: 'back_to_main'}, 'rows': rows,
+        styles = {NAV_CANCEL: 'danger'}
+        st.update({'map': {NAV_CANCEL: 'nav_cancel', NAV_HOME: 'back_to_main'}, 'rows': rows, 'styles': styles,
                    'time': time.time(), 'await': True})
         st['seq'] += 1
         NAV_STATE[chat_id] = st
-    return _nav_rows_to_markup(rows)
+    return _nav_rows_to_markup(rows, styles)
 
 
 def _nav_convert_markup(chat_id, menu):
@@ -461,6 +523,17 @@ def _nav_lookup(st, text):
     if st is None:
         return None
     action = st['map'].get(text)
+    if action is None:
+        stripped = _nav_strip_squares(text)               # label from an old keyboard with a square in front
+        if stripped != text:
+            action = st['map'].get(stripped)
+            if action is None and stripped.endswith('…'):
+                hits = [a for lab, a in st['map'].items() if lab.startswith(stripped[:-1].rstrip())]
+                if len(hits) == 1:
+                    action = hits[0]
+            if action is not None:
+                return action
+            text = stripped
     if action is None:
         norm = re.sub(r'\d+', '#', text)
         hits = [a for lab, a in st['map'].items() if re.sub(r'\d+', '#', lab) == norm and not re.match(r'^\W*\d+\.', lab)]
@@ -556,7 +629,7 @@ def _nav_stale(message):
     st = _nav_get(chat_id)
     note = "Ye option ab available nahi hai. Neeche ke buttons se chuno 👇"
     if st and st.get('rows'):
-        bot.send_message(chat_id, note, reply_markup=_nav_rows_to_markup(st['rows']))
+        bot.send_message(chat_id, note, reply_markup=_nav_rows_to_markup(st['rows'], st.get('styles')))
     else:
         bot.send_message(chat_id, note, reply_markup=create_main_menu_inline(message.from_user.id))
 
