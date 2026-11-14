@@ -6226,12 +6226,16 @@ def _logic_hosting_health(message):
 
 
 def _logic_run_all_scripts(message_or_call):
-    if isinstance(message_or_call, telebot.types.Message):
+    # A key press arrives as a stand-in call object (not a real CallbackQuery), so look at its shape, not its class.
+    _is_call = (isinstance(message_or_call, telebot.types.CallbackQuery)
+                or (hasattr(message_or_call, 'data') and hasattr(message_or_call, 'message')
+                    and not isinstance(message_or_call, telebot.types.Message)))
+    if not _is_call and hasattr(message_or_call, 'from_user') and hasattr(message_or_call, 'chat'):
         admin_user_id = message_or_call.from_user.id
         admin_chat_id = message_or_call.chat.id
         reply_func = lambda text, **kwargs: bot.reply_to(message_or_call, text, **kwargs)
         admin_message_obj_for_script_runner = message_or_call
-    elif isinstance(message_or_call, telebot.types.CallbackQuery):
+    elif _is_call:
         admin_user_id = message_or_call.from_user.id
         admin_chat_id = message_or_call.message.chat.id
         bot.answer_callback_query(message_or_call.id)
